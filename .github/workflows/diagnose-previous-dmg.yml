@@ -1,0 +1,31 @@
+name: Diagnose previous DMG
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - .github/workflows/diagnose-previous-dmg.yml
+permissions:
+  actions: read
+  contents: read
+jobs:
+  diagnose:
+    runs-on: macos-15
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: episode-split-studio-mac-arm64
+          run-id: 43594655383
+          github-token: ${{ github.token }}
+          path: previous
+      - name: Verify disk image and inspect app
+        run: |
+          dmg="previous/拆集工作台-0.1.0-arm64.dmg"
+          shasum -a 256 "$dmg"
+          hdiutil verify "$dmg"
+          mkdir -p "$RUNNER_TEMP/episode-mounted"
+          hdiutil attach -readonly -nobrowse -mountpoint "$RUNNER_TEMP/episode-mounted" "$dmg"
+          app="$RUNNER_TEMP/episode-mounted/拆集工作台.app"
+          test -d "$app"
+          codesign --verify --deep --strict --verbose=2 "$app" || true
+          spctl --assess --verbose --type exec "$app" || true
+          hdiutil detach "$RUNNER_TEMP/episode-mounted"

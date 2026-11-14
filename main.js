@@ -7,7 +7,7 @@ const {spawn}=require('child_process');
 let server=null,window=null,serverConfig=null;
 
 function freePort(){return new Promise((resolve,reject)=>{const s=net.createServer();s.once('error',reject);s.listen(0,'127.0.0.1',()=>{let port=s.address().port;s.close(()=>resolve(port))})})}
-function binary(name){return app.isPackaged?path.join(process.resourcesPath,name):path.join(__dirname,'build',name)}
+function binary(name){return app.isPackaged?path.join(process.resourcesPath,name):name==='episode-agent'?path.join(__dirname,'build','agent-dist',name):path.join(__dirname,'build',name)}
 function startupError(message){dialog.showErrorBox('拆集工作台无法启动',message);app.quit()}
 async function launch(){
  const agent=binary('episode-agent'),bin=binary('bin');

@@ -22,12 +22,12 @@ jobs:
       - name: Package media engine
         run: |
           pyinstaller --noconfirm --clean --onefile --name episode-agent --add-data 'agent/fonts:fonts' agent/agent.py
-          mkdir -p build
-          cp dist/episode-agent build/episode-agent
+          mkdir -p build/agent-dist
+          cp dist/episode-agent build/agent-dist/episode-agent
           node scripts/prepare-binaries.js
           build/bin/ffmpeg -version
           build/bin/ffprobe -version
-          build/episode-agent --help
+          build/agent-dist/episode-agent --help
       - name: Build Apple Silicon DMG
         env:
           CSC_IDENTITY_AUTO_DISCOVERY: 'false'

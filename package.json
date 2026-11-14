@@ -11,7 +11,7 @@
     "productName":"拆集工作台",
     "directories":{"output":"release"},
     "files":["main.js","preload.js","web/**/*","package.json"],
-    "extraResources":[{"from":"build/episode-agent","to":"episode-agent"},{"from":"build/bin","to":"bin"}],
+    "extraResources":[{"from":"build/agent-dist/episode-agent","to":"episode-agent"},{"from":"build/bin","to":"bin"}],
     "mac":{"category":"public.app-category.video","target":[{"target":"dmg","arch":["arm64"]}],"hardenedRuntime":true},
     "dmg":{"title":"拆集工作台"}
   }

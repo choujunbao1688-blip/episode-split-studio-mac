@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Episode Split Studio local processor. Python 3.10+, FFmpeg, Pillow."""
-import argparse, array, base64, hashlib, hmac, json, math, os, re, secrets, shutil, subprocess, sys, threading, time, urllib.parse, wave
+import argparse, array, base64, hashlib, hmac, json, math, os, re, secrets, shutil, subprocess, sys, tempfile, threading, time, urllib.parse, wave
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from PIL import Image, ImageDraw, ImageFont, ImageFilter
@@ -57,9 +57,17 @@ def scan(folder,poster):
  return {'files':files,'warnings':warnings,'duration':sum(f['duration'] for f in files),'size':sum(f['size'] for f in files)}
 
 def persist():
- with LOCK:data={k:STATE.get(k) for k in ('files','poster','plan','settings','warnings')}
- p=CACHE/'state.json';tmp=p.with_suffix('.tmp')
- tmp.write_text(json.dumps(data,ensure_ascii=False));os.replace(tmp,p)
+ with LOCK:
+  data={k:STATE.get(k) for k in ('files','poster','plan','settings','warnings')}
+  CACHE.mkdir(parents=True,exist_ok=True)
+  fd,name=tempfile.mkstemp(prefix='state-',suffix='.tmp',dir=CACHE)
+  try:
+   with os.fdopen(fd,'w',encoding='utf-8') as output:
+    json.dump(data,output,ensure_ascii=False)
+    output.flush();os.fsync(output.fileno())
+   os.replace(name,CACHE/'state.json')
+  finally:
+   Path(name).unlink(missing_ok=True)
 
 def restore():
  try:

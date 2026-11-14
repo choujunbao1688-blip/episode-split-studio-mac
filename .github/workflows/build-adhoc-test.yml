@@ -19,6 +19,11 @@ jobs:
         run: |
           npm install
           python -m pip install Pillow pyinstaller
+      - name: Check state saves and poster preview
+        run: |
+          python -m unittest discover -s tests -v
+          python -c "from pathlib import Path; s=Path('web/index.html').read_text(); Path('web-check.js').write_text(s.split('<script>',1)[1].split('</script>',1)[0])"
+          node --check web-check.js
       - name: Package processing engine
         run: |
           pyinstaller --noconfirm --clean --onefile --name episode-agent --add-data 'agent/fonts:fonts' agent/agent.py
@@ -34,7 +39,7 @@ jobs:
             -c.mac.notarize=false \
             -c.mac.entitlements=build/entitlements.mac.adhoc.plist \
             -c.mac.entitlementsInherit=build/entitlements.mac.adhoc.inherit.plist \
-            -c.dmg.artifactName=episode-split-studio-0.1.1-arm64-adhoc-test.dmg
+            -c.dmg.artifactName=episode-split-studio-0.1.2-arm64-adhoc-test.dmg
       - name: Verify signature and engine startup
         run: |
           app="release/mac-arm64/拆集工作台.app"
@@ -48,13 +53,13 @@ jobs:
           assert result.returncode==0, f'Packaged app failed with exit code {result.returncode}'
           assert 'Packaged engine health check passed' in result.stdout
           PY
-          hdiutil verify release/episode-split-studio-0.1.1-arm64-adhoc-test.dmg
+          hdiutil verify release/episode-split-studio-0.1.2-arm64-adhoc-test.dmg
           mkdir -p "$RUNNER_TEMP/episode-mounted"
-          hdiutil attach -readonly -nobrowse -mountpoint "$RUNNER_TEMP/episode-mounted" release/episode-split-studio-0.1.1-arm64-adhoc-test.dmg
+          hdiutil attach -readonly -nobrowse -mountpoint "$RUNNER_TEMP/episode-mounted" release/episode-split-studio-0.1.2-arm64-adhoc-test.dmg
           codesign --verify --deep --strict --verbose=2 "$RUNNER_TEMP/episode-mounted/拆集工作台.app"
           hdiutil detach "$RUNNER_TEMP/episode-mounted"
       - uses: actions/upload-artifact@v4
         with:
-          name: episode-split-studio-arm64-adhoc-test
-          path: release/episode-split-studio-0.1.1-arm64-adhoc-test.dmg
+          name: episode-split-studio-arm64-adhoc-test-v012
+          path: release/episode-split-studio-0.1.2-arm64-adhoc-test.dmg
           if-no-files-found: error

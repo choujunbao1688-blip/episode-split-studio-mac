@@ -35,6 +35,13 @@ def sortkey(p):
  m=re.search(r'(?i)(?:EP|第)\s*0*(\d+)',p.stem)
  return (int(m.group(1)) if m else 999999,p.name.lower())
 
+def checked_poster(poster):
+ if not poster:return ''
+ q=Path(poster).expanduser().resolve()
+ if not q.is_file() or q.suffix.lower() not in {'.png','.jpg','.jpeg','.webp'}:raise ValueError('海报须为本机可读取的 PNG、JPG 或 WebP。')
+ Image.open(q).verify()
+ return str(q)
+
 def scan(folder,poster):
  root=Path(folder).expanduser().resolve()
  if not root.is_dir(): raise ValueError('剧集目录不存在。NAS 请先在电脑上挂载，再输入挂载目录。')
@@ -48,11 +55,8 @@ def scan(folder,poster):
  numbers=[int(m.group(1)) for f in files if (m:=re.search(r'(?i)EP\s*0*(\d+)',f['name']))]
  if len(numbers)!=len(set(numbers)): warnings.append('存在重复的 EP 编号。')
  if numbers and len(numbers)==len(files) and max(numbers)-min(numbers)+1!=len(numbers): warnings.append('EP 编号存在缺集。')
- if poster:
-  q=Path(poster).expanduser().resolve()
-  if not q.is_file() or q.suffix.lower() not in {'.png','.jpg','.jpeg','.webp'}: raise ValueError('海报须为本机可读取的 PNG、JPG 或 WebP。')
-  Image.open(q).verify()
- with LOCK: STATE.update(files=files,poster=str(q) if poster else '',plan=[],warnings=warnings)
+ poster_path=checked_poster(poster)
+ with LOCK: STATE.update(files=files,poster=poster_path,plan=[],warnings=warnings)
  persist()
  return {'files':files,'warnings':warnings,'duration':sum(f['duration'] for f in files),'size':sum(f['size'] for f in files)}
 
@@ -348,6 +352,11 @@ class Handler(BaseHTTPRequestHandler):
     result=filedialog.askdirectory() if kind=='folder' else filedialog.askopenfilename(filetypes=[('海报','*.png *.jpg *.jpeg *.webp')]);root.destroy()
     self.respond({'path':result})
    elif path=='/scan':self.respond(scan(data.get('folder',''),data.get('poster','')))
+   elif path=='/set-poster':
+    poster_path=checked_poster(data.get('poster',''))
+    with LOCK:STATE['poster']=poster_path
+    persist()
+    self.respond({'poster':poster_path})
    elif path=='/plan':self.respond(start_job('plan',lambda progress:plan(data,progress)))
    elif path=='/update-cut':
     ix=int(data['index']);t=float(data['time'])

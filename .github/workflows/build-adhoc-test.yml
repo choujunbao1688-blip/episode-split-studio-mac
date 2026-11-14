@@ -1,0 +1,60 @@
+name: Build ad-hoc Mac test
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - .github/workflows/build-adhoc-test.yml
+jobs:
+  build:
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install build dependencies
+        run: |
+          npm install
+          python -m pip install Pillow pyinstaller
+      - name: Package processing engine
+        run: |
+          pyinstaller --noconfirm --clean --onefile --name episode-agent --add-data 'agent/fonts:fonts' agent/agent.py
+          mkdir -p build/agent-dist
+          cp dist/episode-agent build/agent-dist/episode-agent
+          node scripts/prepare-binaries.js
+      - name: Create ad-hoc signed test DMG
+        env:
+          CSC_IDENTITY_AUTO_DISCOVERY: 'false'
+        run: |
+          npx electron-builder --mac dmg --arm64 --publish never \
+            -c.mac.identity=- \
+            -c.mac.notarize=false \
+            -c.mac.entitlements=build/entitlements.mac.adhoc.plist \
+            -c.mac.entitlementsInherit=build/entitlements.mac.adhoc.inherit.plist \
+            -c.dmg.artifactName=episode-split-studio-0.1.1-arm64-adhoc-test.dmg
+      - name: Verify signature and engine startup
+        run: |
+          app="release/mac-arm64/拆集工作台.app"
+          codesign --verify --deep --strict --verbose=2 "$app"
+          python - <<'PY'
+          import subprocess
+          executable='release/mac-arm64/拆集工作台.app/Contents/MacOS/拆集工作台'
+          result=subprocess.run([executable,'--self-test'],capture_output=True,text=True,timeout=45)
+          print(result.stdout)
+          print(result.stderr)
+          assert result.returncode==0, f'Packaged app failed with exit code {result.returncode}'
+          assert 'Packaged engine health check passed' in result.stdout
+          PY
+          hdiutil verify release/episode-split-studio-0.1.1-arm64-adhoc-test.dmg
+          mkdir -p "$RUNNER_TEMP/episode-mounted"
+          hdiutil attach -readonly -nobrowse -mountpoint "$RUNNER_TEMP/episode-mounted" release/episode-split-studio-0.1.1-arm64-adhoc-test.dmg
+          codesign --verify --deep --strict --verbose=2 "$RUNNER_TEMP/episode-mounted/拆集工作台.app"
+          hdiutil detach "$RUNNER_TEMP/episode-mounted"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: episode-split-studio-arm64-adhoc-test
+          path: release/episode-split-studio-0.1.1-arm64-adhoc-test.dmg
+          if-no-files-found: error

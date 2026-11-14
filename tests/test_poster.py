@@ -29,7 +29,7 @@ class PosterTests(unittest.TestCase):
                     headers={"X-Studio-Token": agent.TOKEN, "Content-Type": "application/json"},
                 )
                 with urllib.request.urlopen(request) as response:
-                    self.assertEqual(json.load(response)["poster"], str(poster))
+                    self.assertEqual(json.load(response)["poster"], str(poster.resolve()))
                 request = urllib.request.Request(
                     base + "/poster", headers={"X-Studio-Token": agent.TOKEN}
                 )
@@ -38,7 +38,7 @@ class PosterTests(unittest.TestCase):
                     self.assertEqual(response.read(), poster.read_bytes())
                 self.assertEqual(
                     json.loads((agent.CACHE / "state.json").read_text())["poster"],
-                    str(poster),
+                    str(poster.resolve()),
                 )
             finally:
                 server.shutdown()

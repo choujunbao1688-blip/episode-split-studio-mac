@@ -27,7 +27,7 @@ jobs:
           node scripts/prepare-binaries.js
           build/bin/ffmpeg -version
           build/bin/ffprobe -version
-          build/agent-dist/episode-agent --help
+          PATH="$PWD/build/bin:$PATH" build/agent-dist/episode-agent --help
       - name: Build Apple Silicon DMG
         env:
           CSC_IDENTITY_AUTO_DISCOVERY: 'false'

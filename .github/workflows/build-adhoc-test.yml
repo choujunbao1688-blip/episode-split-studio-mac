@@ -4,6 +4,11 @@ on:
   push:
     paths:
       - .github/workflows/build-adhoc-test.yml
+      - agent/**
+      - web/**
+      - tests/**
+      - package.json
+      - main.js
 jobs:
   build:
     runs-on: macos-15

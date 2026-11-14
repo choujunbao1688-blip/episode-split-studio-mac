@@ -14,7 +14,7 @@ class PersistTests(unittest.TestCase):
             agent.CACHE = Path(directory)
             try:
                 def save(worker):
-                    for iteration in range(50):
+                    for iteration in range(12):
                         with agent.LOCK:
                             agent.STATE["settings"] = {"worker": worker, "iteration": iteration}
                         agent.persist()

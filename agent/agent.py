@@ -1,13 +1,14 @@
 #!/usr/bin/env python3
 """Episode Split Studio local processor. Python 3.10+, FFmpeg, Pillow."""
 import argparse, array, base64, hashlib, hmac, json, math, os, re, secrets, shutil, subprocess, sys, tempfile, threading, time, urllib.parse, wave
+from fractions import Fraction
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from PIL import Image, ImageDraw, ImageFont, ImageFilter, ImageChops, ImageStat
+from PIL import Image, ImageDraw, ImageFont, ImageFilter, ImageChops, ImageStat, ImageOps
 
 VIDEO_EXT={'.mp4','.mov','.mkv','.m4v','.avi'}
-STATE={'files':[], 'plan':[], 'settings':{}, 'job':None, 'samples':{}, 'sampleCovers':{}, 'warnings':[], 'orderConfirmed':False}
-PLAN_FIELDS=('target','startEpisode','minSeconds','maxSeconds','language','removeOld','trimIntroSeconds')
+STATE={'files':[], 'plan':[], 'settings':{}, 'job':None, 'samples':{}, 'sampleCovers':{}, 'tailPreviews':{}, 'warnings':[], 'orderConfirmed':False}
+PLAN_FIELDS=('target','startEpisode','minSeconds','maxSeconds','language','removeOld','trimIntroSeconds','trimIntroFrames','autoRemoveIntroCover')
 LOCK=threading.RLock()
 TOKEN=secrets.token_urlsafe(18)
 HOME=Path.home()
@@ -30,7 +31,9 @@ def probe(path):
  if not v: raise ValueError('没有视频流')
  dur=float(d['format'].get('duration') or v.get('duration') or 0)
  if dur<=0: raise ValueError('无法读取时长')
- return {'duration':round(dur,3),'width':v.get('width'), 'height':v.get('height'), 'audio':any(x['codec_type']=='audio' for x in d['streams'])}
+ try:fps=float(Fraction(v.get('avg_frame_rate') or v.get('r_frame_rate') or '25'))
+ except (ValueError,ZeroDivisionError):fps=25
+ return {'duration':round(dur,3),'width':v.get('width'), 'height':v.get('height'), 'fps':fps or 25,'audio':any(x['codec_type']=='audio' for x in d['streams'])}
 
 def sortkey(p):
  number=source_number(p.name)
@@ -65,17 +68,21 @@ def checked_effect_audio(value):
 def checked_effect_visual(value):
  if not value:return ''
  path=Path(value).expanduser().resolve()
- if not path.is_file() or path.suffix.lower() not in {'.png','.webp','.mov','.webm'}:
-  raise ValueError('画面素材须为带透明通道的 PNG、WebP、MOV 或 WebM。')
+ if not path.is_file() or path.suffix.lower() not in {'.png','.webp','.mp4','.m4v','.mov','.webm'}:
+  raise ValueError('画面素材须为本机可读取的 PNG、WebP、MP4、MOV 或 WebM。')
  if path.suffix.lower() in {'.png','.webp'}:
-  with Image.open(path) as im:
-   if 'A' not in im.getbands() and 'transparency' not in im.info:raise ValueError('画面素材没有透明通道，不能叠加在每集人物画面上。')
+  with Image.open(path) as im:im.verify()
  else:
   info=json.loads(run(['ffprobe','-v','error','-select_streams','v:0','-show_entries','stream=pix_fmt','-of','json',str(path)],timeout=30))
-  pix=next((x.get('pix_fmt','') for x in info.get('streams',[])),'')
-  if not any(x in pix for x in ('yuva','rgba','bgra','argb','abgr','gbrap')):
-   raise ValueError('该视频没有透明通道；参考成片需先在剪映导出单独的透明效果层。')
+  if not info.get('streams'):raise ValueError('画面素材没有视频流。')
  return str(path)
+
+def visual_has_alpha(path):
+ if Path(path).suffix.lower() in {'.png','.webp'}:
+  with Image.open(path) as im:return 'A' in im.getbands() or 'transparency' in im.info
+ info=json.loads(run(['ffprobe','-v','error','-select_streams','v:0','-show_entries','stream=pix_fmt','-of','json',str(path)],timeout=30))
+ pix=next((x.get('pix_fmt','') for x in info.get('streams',[])),'')
+ return any(x in pix for x in ('yuva','rgba','bgra','argb','abgr','gbrap'))
 
 def scan(folder,poster):
  root=Path(folder).expanduser().resolve()
@@ -84,7 +91,7 @@ def scan(folder,poster):
  if not paths: raise ValueError('该目录中没有可读取的视频。')
  files=[]; warnings=[]
  for i,p in enumerate(paths):
-  try: meta=probe(p); files.append({'path':str(p),'name':p.name,'size':p.stat().st_size,'sourceNumber':source_number(p.name),'tailTrim':0,**meta})
+  try: meta=probe(p); files.append({'path':str(p),'name':p.name,'size':p.stat().st_size,'sourceNumber':source_number(p.name),'tailTrim':0,'headTrimFrames':0,**meta})
   except Exception as e: warnings.append(f'{p.name}: {e}')
  if not files: raise ValueError('没有成功读取的视频。')
  numbers=[f['sourceNumber'] for f in files if f['sourceNumber'] is not None]
@@ -113,6 +120,8 @@ def restore():
  try:
   d=json.loads((CACHE/'state.json').read_text())
   if all(Path(f['path']).exists() for f in d.get('files',[])):
+   if d.get('plan') and any(k not in (d.get('planParams') or {}) for k in PLAN_FIELDS):
+    d.update(plan=[],planParams=None)
    legacy='sourceOrderMode' not in d
    if d.get('sourceOrderMode')!='manual':
     old=[f['path'] for f in d.get('files',[])]
@@ -173,6 +182,26 @@ def analyse(f):
   if all(abs(c['time']-x['time'])>2 for x in kept): kept.append(c)
  return sorted(kept,key=lambda x:x['time']),round(intro,2),round(tail,2)
 
+def detect_intro_cover_frames(f,poster,max_seconds=4):
+ """Compare native source frames to the selected clean poster, including one-frame covers."""
+ if not poster:return 0
+ fps=float(f.get('fps') or probe(f['path'])['fps'])
+ count=min(240,max(1,round(fps*max_seconds)));w,h=160,284
+ with Image.open(poster) as image:
+  reference=ImageOps.fit(image.convert('L'),(w,h),method=Image.Resampling.LANCZOS).tobytes()
+ command=['ffmpeg','-nostdin','-v','error','-i',f['path'],'-an','-vf',f'scale={w}:{h}:force_original_aspect_ratio=increase,crop={w}:{h},format=gray','-frames:v',str(count),'-f','rawvideo','-']
+ try:
+  p=subprocess.run(command,capture_output=True,timeout=60)
+  if p.returncode:return 0
+ except (subprocess.SubprocessError,OSError):return 0
+ frame_size=w*h;matches=0
+ for offset in range(0,len(p.stdout)-frame_size+1,frame_size):
+  frame=memoryview(p.stdout)[offset:offset+frame_size]
+  error=sum(abs(frame[i]-reference[i]) for i in range(0,frame_size,16))/(frame_size/16)
+  if error>26:break
+  matches+=1
+ return matches
+
 def story_cuts(cands,start,end,minlen,maxlen,threshold=2.45):
  """Keep source boundaries and split only at a strong eligible content cue."""
  out=[];left=start
@@ -199,7 +228,10 @@ def plan(settings, progress):
   progress(f'分析 {i+1}/{len(files)} · {f["name"]}',(i+1)/(len(files)+1)*75)
   candidates,intro,end=analyse(f)
   if not settings.get('removeOld',True):intro=0;end=f['duration']
-  intro=max(intro,float(settings.get('trimIntroSeconds',0)))
+  fps=float(f.get('fps') or probe(f['path'])['fps'])
+  cover_frames=detect_intro_cover_frames(f,STATE.get('poster')) if settings.get('autoRemoveIntroCover',True) else 0
+  frame_skip=max(0,int(settings.get('trimIntroFrames',0)),int(f.get('headTrimFrames',0)))
+  intro=max(intro,cover_frames/fps,frame_skip/fps,float(settings.get('trimIntroSeconds',0)))
   if float(f.get('tailTrim',0))>0:end=min(end,f['duration']-float(f['tailTrim']))
   if end-intro<4:end=f['duration'];intro=0
   analyses.append((candidates,intro,end))
@@ -287,6 +319,20 @@ def bounded(value,default,lo,hi):
  try:return max(lo,min(hi,float(value)))
  except (ValueError,TypeError):return default
 
+def zoom_filter(settings,duration,tail):
+ """Two or three scale keyframes, measured from the beginning of the freeze."""
+ start=bounded(settings.get('zoomStartPct',100),100,100,200)/100
+ middle=bounded(settings.get('zoomMidPct',112),112,100,200)/100
+ end=bounded(settings.get('zoomEndPct',120),120,100,200)/100
+ initial=round(duration*25);total=max(1,round(tail*25))
+ def progress(offset,length):
+  return f'min(max((on-{offset})/{max(1,length)}\\,0)\\,1)'
+ if settings.get('zoomMidEnabled',False):
+  mid=max(1,min(total-1,round(total*bounded(settings.get('zoomMidAt',50),50,5,95)/100)))
+  expression=f'{start}+({middle-start})*{progress(initial,mid)}+({end-middle})*{progress(initial+mid,total-mid)}'
+ else:expression=f'{start}+({end-start})*{progress(initial,total)}'
+ return f"zoompan=z='{expression}':x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':d=1:s=1080x1920:fps=25"
+
 def render_signature(settings,rows=None):
  rows=rows if rows is not None else STATE['plan']
  assets=[]
@@ -309,6 +355,7 @@ def export_one(row,s,out,job=None):
  style=s.get('tailStyle','warmflare') if s.get('tailStyle') in {'warmflare','flash','freeze','custom'} else 'warmflare'
  clip='fps=25,scale=1080:1920:force_original_aspect_ratio=decrease,pad=1080:1920:(ow-iw)/2:(oh-ih)/2,setsar=1,format=yuv420p'
  if tail:clip+=f',tpad=stop_mode=clone:stop_duration={tail}'
+ if tail and s.get('zoomEnabled',False):clip+=','+zoom_filter(s,dur,tail)
  inputs=['-ss',str(start),'-t',str(dur),'-i',f['path']]
  if include_cover:inputs+=['-loop','1','-t','0.8','-i',str(coverpath)]
  sound_index=None
@@ -324,9 +371,11 @@ def export_one(row,s,out,job=None):
   glow_index=len([f['path'],*([str(coverpath)] if include_cover else []),str(sound)])
   inputs+=['-loop','1','-t',str(tail),'-i',str(make_glow(work/'warm-glow.png'))]
  visual_index=None
+ visual_alpha=False
  if tail and style=='custom':
   visual=checked_effect_visual(s.get('tailVisualPath',''))
-  if not visual:raise ValueError('自定义画面效果需选择带透明通道的素材。')
+  if not visual:raise ValueError('自定义画面效果需选择视频或图片素材。')
+  visual_alpha=visual_has_alpha(visual)
   visual_index=len([f['path'],*([str(coverpath)] if include_cover else []),str(sound)])
   if Path(visual).suffix.lower() in {'.png','.webp'}:inputs+=['-loop','1','-t',str(tail),'-i',visual]
   else:inputs+=['-stream_loop','-1','-t',str(tail),'-i',visual]
@@ -350,9 +399,22 @@ def export_one(row,s,out,job=None):
   filters.append(f'[{glow_index}:v]format=rgba,fade=t=in:st=0:d=0.25:alpha=1,fade=t=out:st={max(.25,tail-.45)}:d={min(.45,tail-.25)}:alpha=1,colorchannelmixer=aa={strength},setpts=PTS-STARTPTS+{dur}/TB[glow]')
   filters.append(f'{video}[glow]overlay=x=\'-100+(t-{dur})*160/{tail}\':y=0:shortest=0:eof_action=pass[vglow]');video='[vglow]'
  if visual_index is not None:
-  strength=bounded(s.get('tailLightStrength',55),55,0,100)/100
-  filters.append(f'[{visual_index}:v]fps=25,scale=1080:1920:force_original_aspect_ratio=decrease,format=rgba,pad=1080:1920:(ow-iw)/2:(oh-ih)/2:color=black@0,colorchannelmixer=aa={strength},setpts=PTS-STARTPTS+{dur}/TB[custom]')
-  filters.append(f'{video}[custom]overlay=0:0:shortest=0:eof_action=pass[vcustom]');video='[vcustom]'
+  mode=s.get('tailBlendMode','bright')
+  if mode not in {'bright','screen','lighten','addition'}:mode='bright'
+  opacity=bounded(s.get('tailBlendOpacity',40),40,0,70 if not visual_alpha else 100)/100
+  visual_base=f'[{visual_index}:v]fps=25,scale=1080:1920:force_original_aspect_ratio=decrease,format=rgba,pad=1080:1920:(ow-iw)/2:(oh-ih)/2:color=black@0'
+  if visual_alpha or mode=='bright':
+   if not visual_alpha:
+    cutoff=bounded(s.get('tailBlendCutoff',18),18,0,80)/100
+    soft=bounded(s.get('tailBlendSoftness',12),12,1,50)/100
+    visual_base+=f',lumakey=threshold={cutoff/2}:tolerance={max(.01,cutoff/2)}:softness={soft}'
+   visual_base+=f',colorchannelmixer=aa={opacity},setpts=PTS-STARTPTS+{dur}/TB[custom]'
+   filters.append(visual_base)
+   filters.append(f'{video}[custom]overlay=0:0:shortest=0:eof_action=pass[vcustom]');video='[vcustom]'
+  else:
+   visual_base+=f',format=yuv420p,trim=duration={tail},tpad=start_mode=add:start_duration={dur}:color=black,trim=duration={dur+tail},setpts=PTS-STARTPTS[custom]'
+   filters.append(visual_base)
+   filters.append(f'{video}[custom]blend=all_mode={mode}:all_opacity={opacity}:shortest=0:eof_action=pass:repeatlast=0[vcustom]');video='[vcustom]'
  if tail and style in {'warmflare','flash'}:
   at=bounded(s.get('tailFlashStart',1),1,0,max(0,tail-.1))
   flashdur=bounded(s.get('tailFlashDuration',.3),.3,.1,min(1.5,tail-at))
@@ -420,7 +482,7 @@ class Handler(BaseHTTPRequestHandler):
   path=urllib.parse.urlparse(self.path).path
   query=urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
   provided=self.headers.get('X-Studio-Token','')
-  if path in {'/video','/poster','/sample-cover'}:provided=provided or query.get('token',[''])[0]
+  if path in {'/video','/tail-video','/poster','/sample-cover'}:provided=provided or query.get('token',[''])[0]
   if not hmac.compare_digest(provided,TOKEN):raise PermissionError('连接码错误')
  def respond(self,data,code=200):
   raw=json.dumps(data,ensure_ascii=False,default=str).encode();self.headers_json(code);self.wfile.write(raw)
@@ -442,9 +504,9 @@ class Handler(BaseHTTPRequestHandler):
     p=STATE['sampleCovers'].get(n)
     if not p or not Path(p).is_file():raise ValueError('样片封面不存在')
     self.headers_json(200,'image/png');self.wfile.write(Path(p).read_bytes())
-   elif path=='/video':
+   elif path in {'/video','/tail-video'}:
     query=urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query);n=int(query.get('episode',['-1'])[0])
-    p=STATE['samples'].get(n)
+    p=STATE['samples'].get(n) if path=='/video' else STATE['tailPreviews'].get(n)
     if not p or not Path(p).is_file():raise ValueError('样片不存在')
     size=os.path.getsize(p);a=0;b=size-1;rang=self.headers.get('Range')
     if rang:
@@ -476,7 +538,7 @@ class Handler(BaseHTTPRequestHandler):
     self.respond({'path':result})
    elif path=='/scan':self.respond(scan(data.get('folder',''),data.get('poster','')))
    elif path=='/source-order':
-    paths=data.get('paths',[]);trims=data.get('tailTrims',{});mode=data.get('mode','manual')
+    paths=data.get('paths',[]);trims=data.get('tailTrims',{});head_trims=data.get('headTrims',{});mode=data.get('mode','manual')
     with LOCK:
      existing={f['path']:f for f in STATE['files']}
      if not isinstance(paths,list) or not paths or len(paths)!=len(set(paths)) or any(p not in existing for p in paths):raise ValueError('原集顺序无效，请重新导入。')
@@ -484,6 +546,7 @@ class Handler(BaseHTTPRequestHandler):
      for i,p in enumerate(paths):
       f=dict(existing[p]);f['sourceOrdinal']=i+1
       f['tailTrim']=bounded(trims.get(p,f.get('tailTrim',0)),0,0,30)
+      f['headTrimFrames']=int(bounded(head_trims.get(p,f.get('headTrimFrames',0)),0,0,300))
       if f['duration']-f['tailTrim']<4:raise ValueError(f'{f["name"]} 的片尾裁切过长。')
       ordered.append(f)
      if mode=='auto':ordered.sort(key=lambda f:sortkey(Path(f['name'])))
@@ -528,6 +591,21 @@ class Handler(BaseHTTPRequestHandler):
      STATE['sampleSignature']=render_signature(STATE['settings']);progress('样片可播放',100)
      return {'episode':ep,'url':f'/video?episode={ep}','coverUrl':f'/sample-cover?episode={ep}' if numbered else ''}
     self.respond(start_job('sample',task))
+   elif path=='/tail-preview':
+    with LOCK:STATE['settings'].update(data.get('settings',{}))
+    if STATE.get('planParams')!=plan_key(STATE['settings']):raise ValueError('分集设定已更改，请重新生成切点。')
+    persist()
+    ep=int(data['episode']);row=next((r for r in STATE['plan'] if r['episode']==ep),None)
+    if not row:raise ValueError('找不到该集')
+    def task(progress):
+     progress(f'正在预览 EP{ep} 片尾',15)
+     settings=dict(STATE['settings']);settings.update(coverEnabled=False,tailEnabled=True)
+     preview=dict(row,start=max(float(row['start']),float(row['end'])-1.2))
+     out=CACHE/'previews'/f'EP{ep:03}-tail.mp4'
+     result=export_one(preview,settings,out)
+     STATE['tailPreviews'][ep]=result;progress('片尾预览可播放',100)
+     return {'episode':ep,'url':f'/tail-video?episode={ep}'}
+    self.respond(start_job('tail',task))
    elif path=='/export':
     with LOCK:STATE['settings'].update(data.get('settings',{}))
     if STATE.get('planParams')!=plan_key(STATE['settings']):raise ValueError('分集设定已更改，请重新分析剧情并生成切点。')

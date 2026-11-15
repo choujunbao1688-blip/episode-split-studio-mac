@@ -17,7 +17,7 @@ class OrderCoverTailTests(unittest.TestCase):
             original_state = dict(agent.STATE)
             try:
                 agent.CACHE = root / 'cache'
-                with patch.object(agent, 'probe', return_value={'duration': 70, 'width': 1080, 'height': 1920, 'audio': True}):
+                with patch.object(agent, 'probe', return_value={'duration': 70, 'width': 1080, 'height': 1920, 'fps':25, 'audio': True}):
                     files = agent.scan(root, '')['files']
                 self.assertEqual([f['name'] for f in files], ['1.mp4', '20261112_2.mp4', '成片_10.mp4'])
                 self.assertEqual([f['sourceNumber'] for f in files], [1, 2, 10])
@@ -75,15 +75,16 @@ class OrderCoverTailTests(unittest.TestCase):
             finally:
                 agent.STATE['poster'] = original_poster
 
-    def test_custom_visual_requires_a_transparent_layer(self):
+    def test_custom_visual_accepts_opaque_video_layer_sources(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             transparent, opaque = root / 'overlay.png', root / 'scene.png'
             Image.new('RGBA', (9, 16), (255, 220, 160, 80)).save(transparent)
             Image.new('RGB', (9, 16), (255, 220, 160)).save(opaque)
             self.assertEqual(agent.checked_effect_visual(str(transparent)), str(transparent.resolve()))
-            with self.assertRaisesRegex(ValueError, '透明通道'):
-                agent.checked_effect_visual(str(opaque))
+            self.assertTrue(agent.visual_has_alpha(str(transparent)))
+            self.assertEqual(agent.checked_effect_visual(str(opaque)), str(opaque.resolve()))
+            self.assertFalse(agent.visual_has_alpha(str(opaque)))
 
 
 if __name__ == '__main__':

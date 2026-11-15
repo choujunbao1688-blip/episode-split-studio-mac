@@ -427,10 +427,12 @@ def export_one(row,s,out,job=None):
   vf,af='[vout]','[aout]'
  else:vf,af=video,'[aclip]'
  out.parent.mkdir(parents=True,exist_ok=True)
- tmp=out.with_suffix('.part.mp4')
+ tmp=out.with_name(f'.{out.stem}.{secrets.token_hex(4)}.part.mp4')
  cmd=['ffmpeg','-y','-nostdin','-hide_banner','-loglevel','error',*inputs,'-filter_complex',';'.join(filters),'-map',vf,'-map',af,'-c:v','libx264','-preset',s.get('preset','medium'),'-crf',str(s.get('crf',19)),'-pix_fmt','yuv420p','-r','25','-c:a','aac','-b:a','192k','-ac','2','-ar','48000','-movflags','+faststart',str(tmp)]
- run(cmd)
- os.replace(tmp,out)
+ try:
+  run(cmd)
+  os.replace(tmp,out)
+ finally:tmp.unlink(missing_ok=True)
  return str(out)
 
 def verify_sample_cover(video,cover_path):
@@ -465,6 +467,54 @@ def safe_out(folder):
  if p==Path('/'):raise ValueError('不能将根目录设为输出目录。')
  p.mkdir(parents=True,exist_ok=True)
  return p
+
+def export_stamp_path(folder,episode):
+ """Keep resumable export bookkeeping outside the user's delivery folder."""
+ key=hashlib.sha256(os.fsencode(str(folder.resolve()))).hexdigest()
+ return CACHE/'exports'/key/f'{episode}.json'
+
+def export_stamp_matches_file(stamp,dest):
+ if not dest.is_file() or not stamp.is_file():return False
+ try:
+  info=json.loads(stamp.read_text(encoding='utf-8'))
+  stat=dest.stat()
+  return info.get('size')==stat.st_size and info.get('mtimeNs')==stat.st_mtime_ns
+ except (OSError,ValueError,TypeError):return False
+
+def record_export_stamp(stamp,dest,signature):
+ stamp.parent.mkdir(parents=True,exist_ok=True)
+ stat=dest.stat()
+ data={'signature':signature,'size':stat.st_size,'mtimeNs':stat.st_mtime_ns}
+ fd,name=tempfile.mkstemp(prefix='export-',suffix='.tmp',dir=stamp.parent)
+ try:
+  with os.fdopen(fd,'w',encoding='utf-8') as stream:
+   json.dump(data,stream)
+   stream.flush();os.fsync(stream.fileno())
+  os.replace(name,stamp)
+ finally:Path(name).unlink(missing_ok=True)
+
+def export_episodes(rows,settings,out,progress):
+ episodes=[int(row['episode']) for row in rows]
+ if any(ep<1 for ep in episodes) or len(set(episodes))!=len(episodes):
+  raise ValueError('导出集号必须为不重复的正整数。')
+ # Pure numeric names could collide with unrelated source footage in this folder.
+ for ep in episodes:
+  dest=out/f'{ep}.mp4'
+  if dest.exists() and not export_stamp_matches_file(export_stamp_path(out,ep),dest):
+   raise ValueError(f'{dest.name} 已存在且不是本任务已记录的导出文件；请更换输出目录或先移走该文件。')
+ done=[]
+ for i,row in enumerate(rows):
+  ep=episodes[i];dest=out/f'{ep}.mp4';stamp=export_stamp_path(out,ep)
+  progress(f'导出 {i+1}/{len(rows)} · EP{ep}',i/len(rows)*100)
+  signature=render_signature(settings,[row])
+  if export_stamp_matches_file(stamp,dest):
+   try:
+    if json.loads(stamp.read_text(encoding='utf-8')).get('signature')==signature and probe(dest)['duration']>row['duration']-.5:
+     done.append(str(dest));continue
+   except (OSError,ValueError,KeyError):pass
+  done.append(export_one(row,settings,dest))
+  record_export_stamp(stamp,dest,signature)
+ return {'folder':str(out),'files':len(done)}
 
 class Handler(BaseHTTPRequestHandler):
  def log_message(self,*args):pass
@@ -610,25 +660,11 @@ class Handler(BaseHTTPRequestHandler):
     with LOCK:STATE['settings'].update(data.get('settings',{}))
     if STATE.get('planParams')!=plan_key(STATE['settings']):raise ValueError('分集设定已更改，请重新分析剧情并生成切点。')
     persist()
-    out=safe_out(data['folder']);rows=list(STATE['plan']);settings=dict(STATE['settings']);prefix=re.sub(r'[^\w\u4e00-\u9fff-]','',data.get('prefix','成片'))[:36] or '成片'
+    out=safe_out(data['folder']);rows=list(STATE['plan']);settings=dict(STATE['settings'])
     if not rows:raise ValueError('请先生成拆集方案')
     if STATE.get('sampleSignature')!=render_signature(settings,rows):raise ValueError('封面、切点、源文件或片尾设置已变化，请重新生成样片。')
     if shutil.disk_usage(out).free < sum(f['size'] for f in STATE['files'])*.8:raise ValueError('输出磁盘空间不足，请更换目录或清理空间。')
-    def task(progress):
-     done=[]
-     for i,row in enumerate(rows):
-      progress(f'导出 {i+1}/{len(rows)} · EP{row["episode"]}',i/len(rows)*100)
-      dest=out/f'{prefix}-EP{row["episode"]:02d}.mp4'
-      fingerprint=render_signature(settings,[row])
-      stamp=dest.with_suffix('.splitstamp')
-      if dest.exists() and stamp.exists() and stamp.read_text()==fingerprint:
-       try:
-        if probe(dest)['duration']>row['duration']-.5:done.append(str(dest));continue
-       except Exception:pass
-      done.append(export_one(row,settings,dest));stamp.write_text(fingerprint)
-     manifest=out/'拆集清单.json';manifest.write_text(json.dumps({'settings':settings,'episodes':rows,'files':done},ensure_ascii=False,indent=2))
-     return {'folder':str(out),'files':len(done),'manifest':str(manifest)}
-    self.respond(start_job('export',task))
+    self.respond(start_job('export',lambda progress:export_episodes(rows,settings,out,progress)))
    else:self.respond({'error':'未知路径'},404)
   except Exception as e:self.respond({'error':str(e)},403 if isinstance(e,PermissionError) else 400)
 

@@ -1,6 +1,6 @@
 {
   "name":"episode-split-studio-mac",
-  "version":"0.1.5",
+  "version":"0.1.6",
   "private":true,
   "description":"拆集工作台单体 Mac 应用",
   "main":"main.js",

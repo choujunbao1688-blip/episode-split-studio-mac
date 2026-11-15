@@ -1,0 +1,67 @@
+import tempfile
+import unittest
+from pathlib import Path
+from unittest.mock import patch
+
+from PIL import Image, ImageChops
+from agent import agent
+
+
+class OrderCoverTailTests(unittest.TestCase):
+    def test_numeric_source_order_and_story_cuts_do_not_force_target(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            for name in ('10.mp4', '2.mp4', '1.mp4'):
+                (root / name).touch()
+            original_cache = agent.CACHE
+            original_state = dict(agent.STATE)
+            try:
+                agent.CACHE = root / 'cache'
+                with patch.object(agent, 'probe', return_value={'duration': 70, 'width': 1080, 'height': 1920, 'audio': True}):
+                    files = agent.scan(root, '')['files']
+                self.assertEqual([f['name'] for f in files], ['1.mp4', '2.mp4', '10.mp4'])
+                self.assertEqual([f['sourceNumber'] for f in files], [1, 2, 10])
+                # A missing original episode must be resolved before confirming the order.
+                self.assertNotEqual(files[2]['sourceNumber'], files[1]['sourceNumber'] + 1)
+                agent.STATE['files'] = files[:2]
+                agent.STATE['orderConfirmed'] = True
+                with patch.object(agent, 'analyse', return_value=([], 0, 70)):
+                    result = agent.plan({'startEpisode': 20, 'minSeconds': 45, 'maxSeconds': 60, 'target': 90}, lambda *_: None)
+                self.assertEqual([(r['episode'], r['file'], r['segment']) for r in result['plan']],
+                                 [(20, '1.mp4', 1), (21, '2.mp4', 1)])
+                strong = [{'time': 56, 'score': 3.1, 'reason': '剧情切换'}]
+                self.assertEqual([c['time'] for c in agent.story_cuts(strong, 0, 140, 45, 60)], [56])
+            finally:
+                agent.CACHE = original_cache
+                agent.STATE.clear()
+                agent.STATE.update(original_state)
+
+    def test_cover_uses_percent_coordinates_in_rendered_image(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            poster, output = root / 'poster.png', root / 'cover.png'
+            Image.new('RGB', (1080, 1920), '#69503e').save(poster)
+            original_poster = agent.STATE.get('poster')
+            try:
+                agent.STATE['poster'] = str(poster)
+                agent.cover(output, 20, {'coverEnabled': True, 'numberFormat': 'EP{n}',
+                                         'fontSize': 100, 'positionX': 49, 'positionY': 58})
+                with Image.open(poster) as base, Image.open(output) as rendered:
+                    area = (280, 950, 780, 1300)
+                    self.assertIsNotNone(ImageChops.difference(base.crop(area), rendered.crop(area)).getbbox())
+            finally:
+                agent.STATE['poster'] = original_poster
+
+    def test_custom_visual_requires_a_transparent_layer(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            transparent, opaque = root / 'overlay.png', root / 'scene.png'
+            Image.new('RGBA', (9, 16), (255, 220, 160, 80)).save(transparent)
+            Image.new('RGB', (9, 16), (255, 220, 160)).save(opaque)
+            self.assertEqual(agent.checked_effect_visual(str(transparent)), str(transparent.resolve()))
+            with self.assertRaisesRegex(ValueError, '透明通道'):
+                agent.checked_effect_visual(str(opaque))
+
+
+if __name__ == '__main__':
+    unittest.main()

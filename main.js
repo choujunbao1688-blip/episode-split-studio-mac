@@ -53,7 +53,7 @@ function createWindow(token,port){
 }
 ipcMain.handle('choose-path',async (_event,kind)=>{
  if(!window)return '';
- const choice=kind==='poster'?await dialog.showOpenDialog(window,{title:'选择纯净海报',properties:['openFile'],filters:[{name:'图片',extensions:['png','jpg','jpeg','webp']}]}):await dialog.showOpenDialog(window,{title:kind==='output'?'选择成片导出目录':'选择剧集目录',properties:['openDirectory']});
+ const choice=kind==='poster'?await dialog.showOpenDialog(window,{title:'选择纯净海报',properties:['openFile'],filters:[{name:'图片',extensions:['png','jpg','jpeg','webp']}]}):kind==='effect-audio'?await dialog.showOpenDialog(window,{title:'选择片尾音效',properties:['openFile'],filters:[{name:'音频',extensions:['mp3','wav','m4a','aac','flac']}]}):kind==='effect-visual'?await dialog.showOpenDialog(window,{title:'选择透明画面效果层',properties:['openFile'],filters:[{name:'透明素材',extensions:['png','webp','mov','webm']}]}):await dialog.showOpenDialog(window,{title:kind==='output'?'选择成片导出目录':'选择剧集目录',properties:['openDirectory']});
  return choice.canceled?'':choice.filePaths[0];
 });
 app.on('before-quit',()=>{app.isQuitting=true;if(server)server.kill('SIGTERM')});

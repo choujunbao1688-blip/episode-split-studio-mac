@@ -3,10 +3,11 @@
 import argparse, array, base64, hashlib, hmac, json, math, os, re, secrets, shutil, subprocess, sys, tempfile, threading, time, urllib.parse, wave
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from PIL import Image, ImageDraw, ImageFont, ImageFilter
+from PIL import Image, ImageDraw, ImageFont, ImageFilter, ImageChops, ImageStat
 
 VIDEO_EXT={'.mp4','.mov','.mkv','.m4v','.avi'}
-STATE={'files':[], 'plan':[], 'settings':{}, 'job':None, 'samples':{}, 'warnings':[]}
+STATE={'files':[], 'plan':[], 'settings':{}, 'job':None, 'samples':{}, 'sampleCovers':{}, 'warnings':[], 'orderConfirmed':False}
+PLAN_FIELDS=('target','startEpisode','minSeconds','maxSeconds','language','removeOld','trimIntroSeconds')
 LOCK=threading.RLock()
 TOKEN=secrets.token_urlsafe(18)
 HOME=Path.home()
@@ -32,8 +33,14 @@ def probe(path):
  return {'duration':round(dur,3),'width':v.get('width'), 'height':v.get('height'), 'audio':any(x['codec_type']=='audio' for x in d['streams'])}
 
 def sortkey(p):
- m=re.search(r'(?i)(?:EP|第)\s*0*(\d+)',p.stem)
- return (int(m.group(1)) if m else 999999,p.name.lower())
+ m=re.search(r'(?i)(?:EP|第)\s*0*(\d+)',p.stem) or re.match(r'^\s*0*(\d+)(?:\D|$)',p.stem)
+ parts=tuple(int(x) if x.isdigit() else x.lower() for x in re.split(r'(\d+)',p.stem))
+ return (0,int(m.group(1)),parts,p.name.lower()) if m else (1,0,parts,p.name.lower())
+
+def source_number(name):
+ stem=Path(name).stem
+ m=re.search(r'(?i)(?:EP|第)\s*0*(\d+)',stem) or re.match(r'^\s*0*(\d+)(?:\D|$)',stem)
+ return int(m.group(1)) if m else None
 
 def checked_poster(poster):
  if not poster:return ''
@@ -42,6 +49,29 @@ def checked_poster(poster):
  Image.open(q).verify()
  return str(q)
 
+def checked_effect_audio(value):
+ if not value:return ''
+ path=Path(value).expanduser().resolve()
+ if not path.is_file() or path.suffix.lower() not in {'.mp3','.wav','.m4a','.aac','.flac'}:raise ValueError('音效须为本机可读取的 MP3、WAV、M4A、AAC 或 FLAC。')
+ streams=json.loads(run(['ffprobe','-v','error','-show_streams','-show_format','-of','json',str(path)],timeout=30))
+ if not any(x.get('codec_type')=='audio' for x in streams.get('streams',[])):raise ValueError('音效文件中没有音频流。')
+ return str(path)
+
+def checked_effect_visual(value):
+ if not value:return ''
+ path=Path(value).expanduser().resolve()
+ if not path.is_file() or path.suffix.lower() not in {'.png','.webp','.mov','.webm'}:
+  raise ValueError('画面素材须为带透明通道的 PNG、WebP、MOV 或 WebM。')
+ if path.suffix.lower() in {'.png','.webp'}:
+  with Image.open(path) as im:
+   if 'A' not in im.getbands() and 'transparency' not in im.info:raise ValueError('画面素材没有透明通道，不能叠加在每集人物画面上。')
+ else:
+  info=json.loads(run(['ffprobe','-v','error','-select_streams','v:0','-show_entries','stream=pix_fmt','-of','json',str(path)],timeout=30))
+  pix=next((x.get('pix_fmt','') for x in info.get('streams',[])),'')
+  if not any(x in pix for x in ('yuva','rgba','bgra','argb','abgr','gbrap')):
+   raise ValueError('该视频没有透明通道；参考成片需先在剪映导出单独的透明效果层。')
+ return str(path)
+
 def scan(folder,poster):
  root=Path(folder).expanduser().resolve()
  if not root.is_dir(): raise ValueError('剧集目录不存在。NAS 请先在电脑上挂载，再输入挂载目录。')
@@ -49,20 +79,21 @@ def scan(folder,poster):
  if not paths: raise ValueError('该目录中没有可读取的视频。')
  files=[]; warnings=[]
  for i,p in enumerate(paths):
-  try: meta=probe(p); files.append({'path':str(p),'name':p.name,'size':p.stat().st_size,**meta})
+  try: meta=probe(p); files.append({'path':str(p),'name':p.name,'size':p.stat().st_size,'sourceNumber':source_number(p.name),'tailTrim':0,**meta})
   except Exception as e: warnings.append(f'{p.name}: {e}')
  if not files: raise ValueError('没有成功读取的视频。')
- numbers=[int(m.group(1)) for f in files if (m:=re.search(r'(?i)EP\s*0*(\d+)',f['name']))]
- if len(numbers)!=len(set(numbers)): warnings.append('存在重复的 EP 编号。')
- if numbers and len(numbers)==len(files) and max(numbers)-min(numbers)+1!=len(numbers): warnings.append('EP 编号存在缺集。')
+ numbers=[f['sourceNumber'] for f in files if f['sourceNumber'] is not None]
+ if len(numbers)!=len(set(numbers)): warnings.append('源文件存在相同数字编号；请核对并排除重复文件。')
+ if numbers and len(numbers)==len(files) and max(numbers)-min(numbers)+1!=len(set(numbers)): warnings.append('源文件编号存在缺集或重复。')
+ for i,f in enumerate(files):f['sourceOrdinal']=i+1
  poster_path=checked_poster(poster)
- with LOCK: STATE.update(files=files,poster=poster_path,plan=[],warnings=warnings)
+ with LOCK: STATE.update(files=files,poster=poster_path,plan=[],planParams=None,warnings=warnings,orderConfirmed=False,samples={},sampleCovers={},sampleSignature=None)
  persist()
  return {'files':files,'warnings':warnings,'duration':sum(f['duration'] for f in files),'size':sum(f['size'] for f in files)}
 
 def persist():
  with LOCK:
-  data={k:STATE.get(k) for k in ('files','poster','plan','settings','warnings')}
+  data={k:STATE.get(k) for k in ('files','poster','plan','planParams','settings','warnings','orderConfirmed')}
   CACHE.mkdir(parents=True,exist_ok=True)
   fd,name=tempfile.mkstemp(prefix='state-',suffix='.tmp',dir=CACHE)
   try:
@@ -127,49 +158,45 @@ def analyse(f):
   if all(abs(c['time']-x['time'])>2 for x in kept): kept.append(c)
  return sorted(kept,key=lambda x:x['time']),round(intro,2),round(tail,2)
 
-def boundaries(cands,end,count,minlen,maxlen):
- if count<=1 or end<minlen*2: return []
- out=[]; left=0
- for k in range(1,count):
-  remain=count-k; ideal=end*k/count
-  eligible=[c for c in cands if c['time']-left>=minlen and end-c['time']>=remain*minlen and abs(c['time']-ideal)<=max(maxlen,ideal*.45)]
-  if eligible:
-   c=max(eligible,key=lambda x:x['score']-abs(x['time']-ideal)/maxlen*1.4)
-   t=c['time']; reason=c['reason']; conf=min(99,round(45+c['score']*12))
-  else: t=round(ideal,2); reason='按时长建议，需复核'; conf=30
-  out.append({'time':t,'reason':reason,'confidence':conf,'locked':False});left=t
+def story_cuts(cands,start,end,minlen,maxlen,threshold=2.45):
+ """Keep source boundaries and split only at a strong eligible content cue."""
+ out=[];left=start
+ while end-left>maxlen*1.35:
+  eligible=[c for c in cands if left+minlen<=c['time']<=min(left+maxlen*1.2,end-minlen)
+            and c['score']>=threshold]
+  if not eligible:break
+  c=max(eligible,key=lambda x:x['score']-abs(x['time']-left-maxlen)/maxlen*.65)
+  out.append({'time':c['time'],'reason':c['reason'],'confidence':min(99,round(42+c['score']*13)),'locked':False})
+  left=c['time']
  return out
 
+def plan_key(settings):
+ return {name:settings.get(name) for name in PLAN_FIELDS}
+
 def plan(settings, progress):
- with LOCK: files=list(STATE['files'])
+ with LOCK: files=list(STATE['files']);confirmed=STATE.get('orderConfirmed',False)
  if not files: raise ValueError('请先导入剧集。')
+ if not confirmed:raise ValueError('请先在导入页确认原集顺序。')
  minlen=max(10,float(settings.get('minSeconds',45)));maxlen=max(minlen,float(settings.get('maxSeconds',60)))
- target=max(len(files),int(settings.get('target',len(files)*2)))
+ target=max(1,int(settings.get('target',len(files))))
  analyses=[]
  for i,f in enumerate(files):
   progress(f'分析 {i+1}/{len(files)} · {f["name"]}',(i+1)/(len(files)+1)*75)
   candidates,intro,end=analyse(f)
   if not settings.get('removeOld',True):intro=0;end=f['duration']
   intro=max(intro,float(settings.get('trimIntroSeconds',0)))
+  if float(f.get('tailTrim',0))>0:end=min(end,f['duration']-float(f['tailTrim']))
   if end-intro<4:end=f['duration'];intro=0
   analyses.append((candidates,intro,end))
- # Soft episode count: preserve narrative cuts before duration, target count last.
- counts=[max(1,round((end-intro)/((minlen+maxlen)/2))) for _,intro,end in analyses]
- # Bring total toward requested count only where duration can support the change.
- for _ in range(abs(target-sum(counts))):
-  delta=1 if sum(counts)<target else -1
-  choices=[i for i,(_,intro,end) in enumerate(analyses) if (counts[i]+delta)>=1 and (delta<0 or (end-intro)/(counts[i]+1)>=minlen*.7)]
-  if not choices: break
-  ix=max(choices,key=lambda i: ((analyses[i][2]-analyses[i][1])/(counts[i]+1) if delta>0 else -(analyses[i][2]-analyses[i][1])/max(1,counts[i]-1)))
-  counts[ix]+=delta
  rows=[]; startnum=max(1,int(settings.get('startEpisode',1)))
- for i,(f,(cands,intro,end),count) in enumerate(zip(files,analyses,counts)):
-  local=[dict(c,time=c['time']-intro) for c in cands if intro<c['time']<end]
-  cuts=boundaries(local,end-intro,count,minlen,maxlen)
-  points=[intro]+[x['time']+intro for x in cuts]+[end]
+ threshold=2.45 if target>len(files) else 2.7
+ for i,(f,(cands,intro,end)) in enumerate(zip(files,analyses)):
+  cuts=story_cuts(cands,intro,end,minlen,maxlen,threshold)
+  points=[intro]+[x['time'] for x in cuts]+[end]
   for j in range(len(points)-1):
-   rows.append({'id':len(rows)+1,'episode':startnum+len(rows),'source':i,'file':f['name'],'start':round(points[j],2),'end':round(points[j+1],2),'duration':round(points[j+1]-points[j],2),'cutReason':cuts[j]['reason'] if j<len(cuts) else '原集结尾','confidence':cuts[j]['confidence'] if j<len(cuts) else 90,'review':points[j+1]-points[j]<minlen or points[j+1]-points[j]>maxlen or (j<len(cuts) and cuts[j]['confidence']<40)})
- with LOCK: STATE.update(plan=rows,settings=settings,analyses=[{'candidates':c,'cleanStart':a,'cleanEnd':e} for c,a,e in analyses])
+   duration=points[j+1]-points[j]
+   rows.append({'id':len(rows)+1,'episode':startnum+len(rows),'source':i,'sourceOrdinal':i+1,'sourceNumber':f.get('sourceNumber'),'segment':j+1,'segmentsInSource':len(points)-1,'file':f['name'],'start':round(points[j],2),'end':round(points[j+1],2),'duration':round(duration,2),'cutReason':cuts[j]['reason'] if j<len(cuts) else '原集结尾','confidence':cuts[j]['confidence'] if j<len(cuts) else 90,'review':duration<minlen or duration>maxlen or (j<len(cuts) and cuts[j]['confidence']<40)})
+ with LOCK: STATE.update(plan=rows,planParams=plan_key(settings),settings=settings,analyses=[{'candidates':c,'cleanStart':a,'cleanEnd':e} for c,a,e in analyses],samples={},sampleCovers={},sampleSignature=None)
  persist()
  progress('分析完成',100)
  return {'plan':rows,'count':len(rows),'target':target,'warnings':STATE['warnings']}
@@ -197,12 +224,14 @@ def cover(path,episode,s):
    for char in label:
     draw.text((xx,yy),char,font=font,fill=fill,stroke_width=stroke_width,stroke_fill=fill)
     xx+=draw.textlength(char,font=font)+spacing
-  px=int(w*float(s.get('positionX',.5))); py=int(h*float(s.get('positionY',.26)))
+  px=int(w*max(0,min(100,float(s.get('positionX',50))))/100)
+  py=int(h*max(0,min(100,float(s.get('positionY',26))))/100)
   pos=(int(px-tw/2),int(py-th/2-box[1]))
   shadow=int(s.get('shadowBlur',12)); dx=int(s.get('shadowX',14));dy=int(s.get('shadowY',4))
-  sh=Image.new('RGBA',(w,h));draw_spaced(ImageDraw.Draw(sh),(pos[0]+dx,pos[1]+dy),(0,0,0,255))
-  if shadow: sh=sh.filter(ImageFilter.GaussianBlur(min(40,shadow)))
-  overlay=Image.alpha_composite(overlay,sh)
+  if s.get('shadowEnabled',True):
+   sh=Image.new('RGBA',(w,h));draw_spaced(ImageDraw.Draw(sh),(pos[0]+dx,pos[1]+dy),(0,0,0,255))
+   if shadow: sh=sh.filter(ImageFilter.GaussianBlur(min(40,shadow)))
+   overlay=Image.alpha_composite(overlay,sh)
   c1=s.get('colorStart','#fff4df');c2=s.get('colorEnd','#d49b43')
   def rgb(c):
    try:return tuple(bytes.fromhex(c.lstrip('#'))[:3])
@@ -229,40 +258,114 @@ def make_rise(path,duration=2.2):
    buf+=v.to_bytes(2,'little',signed=True)*2
   w.writeframes(buf)
 
+def make_glow(path):
+ if path.exists():return path
+ glow=Image.new('RGBA',(1080,1920),(0,0,0,0))
+ a=Image.new('RGBA',glow.size);d=ImageDraw.Draw(a)
+ d.ellipse((50,270,780,1530),fill=(255,222,173,200))
+ d.ellipse((380,570,1050,1510),fill=(190,164,255,105))
+ a=a.filter(ImageFilter.GaussianBlur(125))
+ glow=Image.alpha_composite(glow,a);glow.save(path)
+ return path
+
+def bounded(value,default,lo,hi):
+ try:return max(lo,min(hi,float(value)))
+ except (ValueError,TypeError):return default
+
+def render_signature(settings,rows=None):
+ rows=rows if rows is not None else STATE['plan']
+ assets=[]
+ for p in [STATE.get('poster') if settings.get('coverEnabled',True) else None,
+           settings.get('tailAudioPath') if settings.get('tailEnabled',True) else None,
+           settings.get('tailVisualPath') if settings.get('tailEnabled',True) and settings.get('tailStyle')=='custom' else None]:
+  if p:
+   q=Path(p);assets.append((str(q),q.stat().st_size,q.stat().st_mtime_ns))
+ for f in STATE['files']:
+  q=Path(f['path']);assets.append((str(q),q.stat().st_size,q.stat().st_mtime_ns))
+ return hashlib.sha256(json.dumps([rows,settings,assets],sort_keys=True,ensure_ascii=False).encode()).hexdigest()
+
 def export_one(row,s,out,job=None):
  f=STATE['files'][row['source']];start=float(row['start']);dur=float(row['end'])-start
  if dur<=0: raise ValueError('切点顺序错误。')
  work=CACHE/'render';work.mkdir(exist_ok=True)
  coverpath=work/f'cover-{row["episode"]}.png';poster=cover(coverpath,row['episode'],s)
- include_cover=bool(poster and s.get('coverEnabled',True));tail=2.8 if s.get('tailEnabled',True) else 0
+ if s.get('coverEnabled',True) and not poster:raise ValueError('请先选择纯净海报，或关闭分集封面。')
+ include_cover=bool(poster and s.get('coverEnabled',True));tail=bounded(s.get('tailDuration',2.8),2.8,.6,6) if s.get('tailEnabled',True) else 0
+ style=s.get('tailStyle','warmflare') if s.get('tailStyle') in {'warmflare','flash','freeze','custom'} else 'warmflare'
  clip='fps=25,scale=1080:1920:force_original_aspect_ratio=decrease,pad=1080:1920:(ow-iw)/2:(oh-ih)/2,setsar=1,format=yuv420p'
- if tail:clip+=f',tpad=stop_mode=clone:stop_duration={tail},fade=t=out:st={dur+2.4}:d=0.4:color=white'
+ if tail:clip+=f',tpad=stop_mode=clone:stop_duration={tail}'
  inputs=['-ss',str(start),'-t',str(dur),'-i',f['path']]
  if include_cover:inputs+=['-loop','1','-t','0.8','-i',str(coverpath)]
- rise=None
+ sound_index=None
  if tail:
-  rise=work/'rise.wav'
-  if not rise.exists():make_rise(rise)
-  inputs+=['-i',str(rise)]
+  sound=checked_effect_audio(s.get('tailAudioPath',''))
+  if not sound:
+   sound=work/'rise.wav'
+   if not sound.exists():make_rise(sound)
+  sound_index=2 if include_cover else 1
+  inputs+=['-i',str(sound)]
+ glow_index=None
+ if tail and style=='warmflare':
+  glow_index=len([f['path'],*([str(coverpath)] if include_cover else []),str(sound)])
+  inputs+=['-loop','1','-t',str(tail),'-i',str(make_glow(work/'warm-glow.png'))]
+ visual_index=None
+ if tail and style=='custom':
+  visual=checked_effect_visual(s.get('tailVisualPath',''))
+  if not visual:raise ValueError('自定义画面效果需选择带透明通道的素材。')
+  visual_index=len([f['path'],*([str(coverpath)] if include_cover else []),str(sound)])
+  if Path(visual).suffix.lower() in {'.png','.webp'}:inputs+=['-loop','1','-t',str(tail),'-i',visual]
+  else:inputs+=['-stream_loop','-1','-t',str(tail),'-i',visual]
  filters=[f'[0:v]{clip}[vclip]']
- if f['audio']:filters.append(f'[0:a]aresample=48000,aformat=channel_layouts=stereo,apad,atrim=duration={dur+tail},asetpts=PTS-STARTPTS[abase]')
+ fade=bounded(s.get('tailOriginalFade',.25),.25,0,2)
+ if f['audio']:
+  original=f'[0:a]aresample=48000,aformat=channel_layouts=stereo,atrim=duration={dur},asetpts=PTS-STARTPTS'
+  if tail and fade:original+=f',afade=t=out:st={max(0,dur-fade)}:d={min(fade,dur)}'
+  filters.append(original+f',apad,atrim=duration={dur+tail}[abase]')
  else:filters.append(f'anullsrc=r=48000:cl=stereo,atrim=duration={dur+tail}[abase]')
  if tail:
-  ri=2 if include_cover else 1
-  delay=max(0,int((dur+tail-2.2)*1000))
-  filters.append(f'[{ri}:a]aresample=48000,adelay={delay}|{delay},atrim=duration={dur+tail}[rise]')
-  filters.append('[abase][rise]amix=inputs=2:duration=first:normalize=0[aclip]')
+  offset=bounded(s.get('tailAudioOffset',.1),.1,0,5)
+  gain=bounded(s.get('tailAudioVolume',80),80,0,150)/100
+  delay=max(0,int((dur+min(offset,tail))*1000))
+  filters.append(f'[{sound_index}:a]aresample=48000,aformat=channel_layouts=stereo,volume={gain},adelay={delay}|{delay},atrim=duration={dur+tail}[rise]')
+  filters.append('[abase][rise]amix=inputs=2:duration=first:normalize=0,alimiter=limit=0.96[aclip]')
  else: filters.append('[abase]anull[aclip]')
+ video='[vclip]'
+ if glow_index is not None:
+  strength=bounded(s.get('tailLightStrength',55),55,0,100)/100
+  filters.append(f'[{glow_index}:v]format=rgba,fade=t=in:st=0:d=0.25:alpha=1,fade=t=out:st={max(.25,tail-.45)}:d={min(.45,tail-.25)}:alpha=1,colorchannelmixer=aa={strength},setpts=PTS-STARTPTS+{dur}/TB[glow]')
+  filters.append(f'{video}[glow]overlay=x=\'-100+(t-{dur})*160/{tail}\':y=0:shortest=0:eof_action=pass[vglow]');video='[vglow]'
+ if visual_index is not None:
+  strength=bounded(s.get('tailLightStrength',55),55,0,100)/100
+  filters.append(f'[{visual_index}:v]fps=25,scale=1080:1920:force_original_aspect_ratio=decrease,format=rgba,pad=1080:1920:(ow-iw)/2:(oh-ih)/2:color=black@0,colorchannelmixer=aa={strength},setpts=PTS-STARTPTS+{dur}/TB[custom]')
+  filters.append(f'{video}[custom]overlay=0:0:shortest=0:eof_action=pass[vcustom]');video='[vcustom]'
+ if tail and style in {'warmflare','flash'}:
+  at=bounded(s.get('tailFlashStart',1),1,0,max(0,tail-.1))
+  flashdur=bounded(s.get('tailFlashDuration',.3),.3,.1,min(1.5,tail-at))
+  strength=bounded(s.get('tailFlashStrength',60),60,0,100)/100
+  color='0xffe9c8' if style=='warmflare' else 'white'
+  filters.append(f'color=c={color}:s=1080x1920:r=25:d={flashdur},format=rgba,fade=t=in:st=0:d={flashdur/2}:alpha=1,fade=t=out:st={flashdur/2}:d={flashdur/2}:alpha=1,colorchannelmixer=aa={strength},setpts=PTS-STARTPTS+{dur+at}/TB[vflash]')
+  filters.append(f'{video}[vflash]overlay=0:0:shortest=0:eof_action=pass,format=yuv420p[vfx]');video='[vfx]'
  if include_cover:
-  filters += ['[1:v]fps=25,scale=1080:1920:force_original_aspect_ratio=decrease,pad=1080:1920:(ow-iw)/2:(oh-ih)/2,setsar=1,format=yuv420p[vcover]','anullsrc=r=48000:cl=stereo,atrim=duration=0.8[asilence]','[vcover][asilence][vclip][aclip]concat=n=2:v=1:a=1[vout][aout]']
+  filters += ['[1:v]fps=25,scale=1080:1920:force_original_aspect_ratio=decrease,pad=1080:1920:(ow-iw)/2:(oh-ih)/2,setsar=1,format=yuv420p[vcover]','anullsrc=r=48000:cl=stereo,atrim=duration=0.8[asilence]',f'[vcover][asilence]{video}[aclip]concat=n=2:v=1:a=1[vout][aout]']
   vf,af='[vout]','[aout]'
- else:vf,af='[vclip]','[aclip]'
+ else:vf,af=video,'[aclip]'
  out.parent.mkdir(parents=True,exist_ok=True)
  tmp=out.with_suffix('.part.mp4')
  cmd=['ffmpeg','-y','-nostdin','-hide_banner','-loglevel','error',*inputs,'-filter_complex',';'.join(filters),'-map',vf,'-map',af,'-c:v','libx264','-preset',s.get('preset','medium'),'-crf',str(s.get('crf',19)),'-pix_fmt','yuv420p','-r','25','-c:a','aac','-b:a','192k','-ac','2','-ar','48000','-movflags','+faststart',str(tmp)]
  run(cmd)
  os.replace(tmp,out)
  return str(out)
+
+def verify_sample_cover(video,cover_path):
+ """Compare the decoded first frame with the actual numbered cover."""
+ with tempfile.TemporaryDirectory() as directory:
+  frame=Path(directory)/'first.png'
+  run(['ffmpeg','-y','-nostdin','-loglevel','error','-ss','0.2','-i',str(video),'-frames:v','1',str(frame)],timeout=60)
+  with Image.open(frame) as first, Image.open(cover_path) as expected:
+   first=first.convert('RGB').resize((270,480))
+   expected=expected.convert('RGB').resize((270,480))
+   error=sum(ImageStat.Stat(ImageChops.difference(first,expected)).mean)/3
+   if error>28:raise RuntimeError('样片首帧与编号封面不一致，请检查渲染设置。')
 
 def start_job(kind,fn):
  with LOCK:
@@ -302,7 +405,7 @@ class Handler(BaseHTTPRequestHandler):
   path=urllib.parse.urlparse(self.path).path
   query=urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
   provided=self.headers.get('X-Studio-Token','')
-  if path in {'/video','/poster'}:provided=provided or query.get('token',[''])[0]
+  if path in {'/video','/poster','/sample-cover'}:provided=provided or query.get('token',[''])[0]
   if not hmac.compare_digest(provided,TOKEN):raise PermissionError('连接码错误')
  def respond(self,data,code=200):
   raw=json.dumps(data,ensure_ascii=False,default=str).encode();self.headers_json(code);self.wfile.write(raw)
@@ -319,6 +422,11 @@ class Handler(BaseHTTPRequestHandler):
     p=STATE.get('poster')
     if not p or not Path(p).is_file():raise ValueError('未选择海报')
     raw=Path(p).read_bytes();self.headers_json(200,'image/jpeg' if Path(p).suffix.lower() in {'.jpg','.jpeg'} else 'image/png' if Path(p).suffix.lower()=='.png' else 'image/webp');self.wfile.write(raw)
+   elif path=='/sample-cover':
+    query=urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query);n=int(query.get('episode',['-1'])[0])
+    p=STATE['sampleCovers'].get(n)
+    if not p or not Path(p).is_file():raise ValueError('样片封面不存在')
+    self.headers_json(200,'image/png');self.wfile.write(Path(p).read_bytes())
    elif path=='/video':
     query=urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query);n=int(query.get('episode',['-1'])[0])
     p=STATE['samples'].get(n)
@@ -352,43 +460,74 @@ class Handler(BaseHTTPRequestHandler):
     result=filedialog.askdirectory() if kind=='folder' else filedialog.askopenfilename(filetypes=[('海报','*.png *.jpg *.jpeg *.webp')]);root.destroy()
     self.respond({'path':result})
    elif path=='/scan':self.respond(scan(data.get('folder',''),data.get('poster','')))
+   elif path=='/source-order':
+    paths=data.get('paths',[]);trims=data.get('tailTrims',{})
+    with LOCK:
+     existing={f['path']:f for f in STATE['files']}
+     if not isinstance(paths,list) or not paths or len(paths)!=len(set(paths)) or any(p not in existing for p in paths):raise ValueError('原集顺序无效，请重新导入。')
+     ordered=[]
+     for i,p in enumerate(paths):
+      f=dict(existing[p]);f['sourceOrdinal']=i+1
+      f['tailTrim']=bounded(trims.get(p,f.get('tailTrim',0)),0,0,30)
+      if f['duration']-f['tailTrim']<4:raise ValueError(f'{f["name"]} 的片尾裁切过长。')
+      ordered.append(f)
+     numbers=[f['sourceNumber'] for f in ordered]
+     if all(n is not None for n in numbers) and any(b!=a+1 for a,b in zip(numbers,numbers[1:])):
+      raise ValueError('原集数字编号必须逐集递增 1；请调整顺序、排除重复文件或补齐缺集。')
+     STATE.update(files=ordered,plan=[],planParams=None,samples={},sampleCovers={},sampleSignature=None,orderConfirmed=True)
+    persist()
+    self.respond({'files':ordered,'duration':sum(f['duration'] for f in ordered),'size':sum(f['size'] for f in ordered)})
    elif path=='/set-poster':
     poster_path=checked_poster(data.get('poster',''))
-    with LOCK:STATE['poster']=poster_path
+    with LOCK:STATE['poster']=poster_path;STATE['samples']={};STATE['sampleCovers']={};STATE['sampleSignature']=None
     persist()
     self.respond({'poster':poster_path})
+   elif path=='/validate-effect-audio':
+    self.respond({'path':checked_effect_audio(data.get('path',''))})
+   elif path=='/validate-effect-visual':
+    self.respond({'path':checked_effect_visual(data.get('path',''))})
    elif path=='/plan':self.respond(start_job('plan',lambda progress:plan(data,progress)))
    elif path=='/update-cut':
     ix=int(data['index']);t=float(data['time'])
     with LOCK:
-     rows=STATE['plan'];a=rows[ix];b=rows[ix+1]
-     if a['source']!=b['source'] or t<=a['start']+3 or t>=b['end']-3:raise ValueError('切点须在同一原集内，且两侧至少保留 3 秒。')
+     rows=STATE['plan'];a=rows[ix];b=rows[ix+1] if ix+1<len(rows) else None
+     adjacent=bool(b and a['source']==b['source'])
+     upper=b['end']-3 if adjacent else STATE['files'][a['source']]['duration']
+     if t<=a['start']+3 or t>=upper:raise ValueError('切点需在原集时长内；相邻片段两侧至少保留 3 秒。')
      a['end']=t;a['duration']=round(t-a['start'],2);a['cutReason']='人工调整';a['confidence']=100;a['review']=False
-     b['start']=t;b['duration']=round(b['end']-t,2)
+     if adjacent:b['start']=t;b['duration']=round(b['end']-t,2)
+     STATE['samples']={};STATE['sampleCovers']={};STATE['sampleSignature']=None
     persist()
     self.respond({'plan':rows})
    elif path=='/sample':
     with LOCK:STATE['settings'].update(data.get('settings',{}))
+    if STATE.get('planParams')!=plan_key(STATE['settings']):raise ValueError('分集设定已更改，请重新分析剧情并生成切点。')
     persist()
     ep=int(data['episode']);row=next((r for r in STATE['plan'] if r['episode']==ep),None)
     if not row:raise ValueError('找不到该集')
     def task(progress):
      progress(f'正在渲染 EP{ep} 样片',15)
      out=CACHE/'samples'/f'EP{ep:03}.mp4';result=export_one(row,STATE['settings'],out)
-     STATE['samples'][ep]=result;progress('样片可播放',100);return {'episode':ep,'url':f'/video?episode={ep}'}
+     numbered=CACHE/'render'/f'cover-{ep}.png' if STATE['settings'].get('coverEnabled',True) else None
+     if numbered:verify_sample_cover(out,numbered)
+     STATE['samples'][ep]=result;STATE['sampleCovers'][ep]=str(numbered) if numbered else ''
+     STATE['sampleSignature']=render_signature(STATE['settings']);progress('样片可播放',100)
+     return {'episode':ep,'url':f'/video?episode={ep}','coverUrl':f'/sample-cover?episode={ep}' if numbered else ''}
     self.respond(start_job('sample',task))
    elif path=='/export':
     with LOCK:STATE['settings'].update(data.get('settings',{}))
+    if STATE.get('planParams')!=plan_key(STATE['settings']):raise ValueError('分集设定已更改，请重新分析剧情并生成切点。')
     persist()
     out=safe_out(data['folder']);rows=list(STATE['plan']);settings=dict(STATE['settings']);prefix=re.sub(r'[^\w\u4e00-\u9fff-]','',data.get('prefix','成片'))[:36] or '成片'
     if not rows:raise ValueError('请先生成拆集方案')
+    if STATE.get('sampleSignature')!=render_signature(settings,rows):raise ValueError('封面、切点、源文件或片尾设置已变化，请重新生成样片。')
     if shutil.disk_usage(out).free < sum(f['size'] for f in STATE['files'])*.8:raise ValueError('输出磁盘空间不足，请更换目录或清理空间。')
     def task(progress):
      done=[]
      for i,row in enumerate(rows):
       progress(f'导出 {i+1}/{len(rows)} · EP{row["episode"]}',i/len(rows)*100)
       dest=out/f'{prefix}-EP{row["episode"]:02d}.mp4'
-      fingerprint=hashlib.sha256(json.dumps([row,settings,STATE['files'][row['source']]['size']],sort_keys=True,ensure_ascii=False).encode()).hexdigest()
+      fingerprint=render_signature(settings,[row])
       stamp=dest.with_suffix('.splitstamp')
       if dest.exists() and stamp.exists() and stamp.read_text()==fingerprint:
        try:

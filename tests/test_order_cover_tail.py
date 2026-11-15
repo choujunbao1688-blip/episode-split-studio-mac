@@ -11,7 +11,7 @@ class OrderCoverTailTests(unittest.TestCase):
     def test_numeric_source_order_and_story_cuts_do_not_force_target(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            for name in ('10.mp4', '2.mp4', '1.mp4'):
+            for name in ('成片_10.mp4', '20261112_2.mp4', '1.mp4'):
                 (root / name).touch()
             original_cache = agent.CACHE
             original_state = dict(agent.STATE)
@@ -19,18 +19,41 @@ class OrderCoverTailTests(unittest.TestCase):
                 agent.CACHE = root / 'cache'
                 with patch.object(agent, 'probe', return_value={'duration': 70, 'width': 1080, 'height': 1920, 'audio': True}):
                     files = agent.scan(root, '')['files']
-                self.assertEqual([f['name'] for f in files], ['1.mp4', '2.mp4', '10.mp4'])
+                self.assertEqual([f['name'] for f in files], ['1.mp4', '20261112_2.mp4', '成片_10.mp4'])
                 self.assertEqual([f['sourceNumber'] for f in files], [1, 2, 10])
-                # A missing original episode must be resolved before confirming the order.
+                self.assertTrue(agent.STATE['orderConfirmed'])
+                # A gap is flagged, but does not prevent use of the imported order.
                 self.assertNotEqual(files[2]['sourceNumber'], files[1]['sourceNumber'] + 1)
-                agent.STATE['files'] = files[:2]
-                agent.STATE['orderConfirmed'] = True
                 with patch.object(agent, 'analyse', return_value=([], 0, 70)):
                     result = agent.plan({'startEpisode': 20, 'minSeconds': 45, 'maxSeconds': 60, 'target': 90}, lambda *_: None)
                 self.assertEqual([(r['episode'], r['file'], r['segment']) for r in result['plan']],
-                                 [(20, '1.mp4', 1), (21, '2.mp4', 1)])
+                                 [(20, '1.mp4', 1), (21, '20261112_2.mp4', 1), (22, '成片_10.mp4', 1)])
                 strong = [{'time': 56, 'score': 3.1, 'reason': '剧情切换'}]
                 self.assertEqual([c['time'] for c in agent.story_cuts(strong, 0, 140, 45, 60)], [56])
+            finally:
+                agent.CACHE = original_cache
+                agent.STATE.clear()
+                agent.STATE.update(original_state)
+
+    def test_restores_previous_state_in_numeric_order(self):
+        import json
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            for name in ('10.mp4', '2.mp4', '1.mp4'):
+                (root / name).touch()
+            original_cache = agent.CACHE
+            original_state = dict(agent.STATE)
+            try:
+                agent.CACHE = root / 'cache'
+                agent.CACHE.mkdir()
+                state = {'files': [{'path': str(root / name), 'name': name, 'duration': 60}
+                                   for name in ('1.mp4', '10.mp4', '2.mp4')],
+                         'plan': [{'episode': 20, 'file': '10.mp4'}], 'orderConfirmed': True}
+                (agent.CACHE / 'state.json').write_text(json.dumps(state))
+                agent.restore()
+                self.assertEqual([f['name'] for f in agent.STATE['files']], ['1.mp4', '2.mp4', '10.mp4'])
+                self.assertEqual(agent.STATE['plan'], [])
+                self.assertTrue(agent.STATE['orderConfirmed'])
             finally:
                 agent.CACHE = original_cache
                 agent.STATE.clear()

@@ -33,13 +33,18 @@ def probe(path):
  return {'duration':round(dur,3),'width':v.get('width'), 'height':v.get('height'), 'audio':any(x['codec_type']=='audio' for x in d['streams'])}
 
 def sortkey(p):
- m=re.search(r'(?i)(?:EP|第)\s*0*(\d+)',p.stem) or re.match(r'^\s*0*(\d+)(?:\D|$)',p.stem)
+ number=source_number(p.name)
  parts=tuple(int(x) if x.isdigit() else x.lower() for x in re.split(r'(\d+)',p.stem))
- return (0,int(m.group(1)),parts,p.name.lower()) if m else (1,0,parts,p.name.lower())
+ return (0,number,parts,p.name.lower()) if number is not None else (1,0,parts,p.name.lower())
 
 def source_number(name):
  stem=Path(name).stem
- m=re.search(r'(?i)(?:EP|第)\s*0*(\d+)',stem) or re.match(r'^\s*0*(\d+)(?:\D|$)',stem)
+ m=re.search(r'(?i)(?:EP|第)\s*0*(\d+)',stem)
+ if m:return int(m.group(1))
+ # Common exports include a title or date before the episode number.
+ m=re.search(r'(?:^|\D)0*(\d+)\s*(?:\(\d+\))?$',stem)
+ if m:return int(m.group(1))
+ m=re.match(r'^\s*0*(\d+)(?:\D|$)',stem)
  return int(m.group(1)) if m else None
 
 def checked_poster(poster):
@@ -87,13 +92,13 @@ def scan(folder,poster):
  if numbers and len(numbers)==len(files) and max(numbers)-min(numbers)+1!=len(set(numbers)): warnings.append('源文件编号存在缺集或重复。')
  for i,f in enumerate(files):f['sourceOrdinal']=i+1
  poster_path=checked_poster(poster)
- with LOCK: STATE.update(files=files,poster=poster_path,plan=[],planParams=None,warnings=warnings,orderConfirmed=False,samples={},sampleCovers={},sampleSignature=None)
+ with LOCK: STATE.update(files=files,poster=poster_path,plan=[],planParams=None,warnings=warnings,orderConfirmed=True,sourceOrderMode='auto',samples={},sampleCovers={},sampleSignature=None)
  persist()
  return {'files':files,'warnings':warnings,'duration':sum(f['duration'] for f in files),'size':sum(f['size'] for f in files)}
 
 def persist():
  with LOCK:
-  data={k:STATE.get(k) for k in ('files','poster','plan','planParams','settings','warnings','orderConfirmed')}
+  data={k:STATE.get(k) for k in ('files','poster','plan','planParams','settings','warnings','orderConfirmed','sourceOrderMode')}
   CACHE.mkdir(parents=True,exist_ok=True)
   fd,name=tempfile.mkstemp(prefix='state-',suffix='.tmp',dir=CACHE)
   try:
@@ -107,7 +112,17 @@ def persist():
 def restore():
  try:
   d=json.loads((CACHE/'state.json').read_text())
-  if all(Path(f['path']).exists() for f in d.get('files',[])):STATE.update(d)
+  if all(Path(f['path']).exists() for f in d.get('files',[])):
+   legacy='sourceOrderMode' not in d
+   if d.get('sourceOrderMode')!='manual':
+    old=[f['path'] for f in d.get('files',[])]
+    d['files']=sorted(d.get('files',[]),key=lambda f:sortkey(Path(f['name'])))
+    for i,f in enumerate(d['files']):f.update(sourceNumber=source_number(f['name']),sourceOrdinal=i+1)
+    d['sourceOrderMode']='auto';d['orderConfirmed']=bool(d['files'])
+    if old!=[f['path'] for f in d['files']] or legacy:
+     d.update(plan=[],planParams=None)
+   STATE.update(d)
+   persist()
  except Exception:pass
 
 def analyse(f):
@@ -461,7 +476,7 @@ class Handler(BaseHTTPRequestHandler):
     self.respond({'path':result})
    elif path=='/scan':self.respond(scan(data.get('folder',''),data.get('poster','')))
    elif path=='/source-order':
-    paths=data.get('paths',[]);trims=data.get('tailTrims',{})
+    paths=data.get('paths',[]);trims=data.get('tailTrims',{});mode=data.get('mode','manual')
     with LOCK:
      existing={f['path']:f for f in STATE['files']}
      if not isinstance(paths,list) or not paths or len(paths)!=len(set(paths)) or any(p not in existing for p in paths):raise ValueError('原集顺序无效，请重新导入。')
@@ -471,10 +486,9 @@ class Handler(BaseHTTPRequestHandler):
       f['tailTrim']=bounded(trims.get(p,f.get('tailTrim',0)),0,0,30)
       if f['duration']-f['tailTrim']<4:raise ValueError(f'{f["name"]} 的片尾裁切过长。')
       ordered.append(f)
-     numbers=[f['sourceNumber'] for f in ordered]
-     if all(n is not None for n in numbers) and any(b!=a+1 for a,b in zip(numbers,numbers[1:])):
-      raise ValueError('原集数字编号必须逐集递增 1；请调整顺序、排除重复文件或补齐缺集。')
-     STATE.update(files=ordered,plan=[],planParams=None,samples={},sampleCovers={},sampleSignature=None,orderConfirmed=True)
+     if mode=='auto':ordered.sort(key=lambda f:sortkey(Path(f['name'])))
+     for i,f in enumerate(ordered):f['sourceOrdinal']=i+1
+     STATE.update(files=ordered,plan=[],planParams=None,samples={},sampleCovers={},sampleSignature=None,orderConfirmed=True,sourceOrderMode='auto' if mode=='auto' else 'manual')
     persist()
     self.respond({'files':ordered,'duration':sum(f['duration'] for f in ordered),'size':sum(f['size'] for f in ordered)})
    elif path=='/set-poster':

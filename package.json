@@ -1,19 +1,70 @@
 {
-  "name":"episode-split-studio-mac",
-  "version":"0.1.6",
-  "private":true,
-  "description":"拆集工作台单体 Mac 应用",
-  "main":"main.js",
-  "scripts":{"start":"electron .","dist:mac":"electron-builder --mac dmg --arm64 --publish never"},
-  "devDependencies":{"electron":"^39.0.0","electron-builder":"^26.0.0","ffmpeg-static":"^5.2.0","@ffprobe-installer/ffprobe":"^2.1.2"},
-  "build":{
-    "appId":"com.yunying.episodesplit",
-    "productName":"拆集工作台",
-    "directories":{"output":"release"},
-    "forceCodeSigning":true,
-    "files":["main.js","preload.js","web/**/*","package.json"],
-    "extraResources":[{"from":"build/agent-dist/episode-agent","to":"episode-agent"},{"from":"build/bin","to":"bin"}],
-    "mac":{"category":"public.app-category.video","target":[{"target":"dmg","arch":["arm64"]}],"hardenedRuntime":true,"entitlements":"build/entitlements.mac.plist","entitlementsInherit":"build/entitlements.mac.inherit.plist","binaries":["Contents/Resources/episode-agent","Contents/Resources/bin/ffmpeg","Contents/Resources/bin/ffprobe"],"notarize":true},
-    "dmg":{"title":"拆集工作台"}
+  "name": "episode-split-studio-mac",
+  "version": "0.1.7-beta.1",
+  "private": true,
+  "description": "拆集工作台单体 Mac 应用",
+  "main": "main.js",
+  "scripts": {
+    "start": "electron .",
+    "dist:mac": "electron-builder --mac dmg --arm64 --publish never"
+  },
+  "devDependencies": {
+    "electron": "^39.0.0",
+    "electron-builder": "^26.0.0",
+    "ffmpeg-static": "^5.2.0",
+    "@ffprobe-installer/ffprobe": "^2.1.2"
+  },
+  "build": {
+    "appId": "com.yunying.episodesplit",
+    "productName": "拆集工作台",
+    "directories": {
+      "output": "release"
+    },
+    "forceCodeSigning": true,
+    "files": [
+      "main.js",
+      "preload.js",
+      "web/**/*",
+      "package.json"
+    ],
+    "extraResources": [
+      {
+        "from": "build/agent-dist/episode-agent",
+        "to": "episode-agent"
+      },
+      {
+        "from": "build/bin",
+        "to": "bin"
+      },
+      {
+        "from": "build/models",
+        "to": "models"
+      }
+    ],
+    "mac": {
+      "category": "public.app-category.video",
+      "target": [
+        {
+          "target": "dmg",
+          "arch": [
+            "arm64"
+          ]
+        }
+      ],
+      "hardenedRuntime": true,
+      "entitlements": "build/entitlements.mac.plist",
+      "entitlementsInherit": "build/entitlements.mac.inherit.plist",
+      "binaries": [
+        "Contents/Resources/episode-agent",
+        "Contents/Resources/bin/ffmpeg",
+        "Contents/Resources/bin/ffprobe",
+        "Contents/Resources/bin/episode-ocr",
+        "Contents/Resources/bin/whisper-cli"
+      ],
+      "notarize": true
+    },
+    "dmg": {
+      "title": "拆集工作台"
+    }
   }
 }

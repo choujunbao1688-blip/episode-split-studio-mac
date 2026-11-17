@@ -28,10 +28,10 @@ async function smoke(token,port){
  startupError(`打包后的处理引擎未通过本机启动检测：${error?.message||'未知错误'}`);
 }
 async function launch(){
- const agent=binary('episode-agent'),bin=binary('bin');
- if(!fs.existsSync(agent)||!fs.existsSync(path.join(bin,'ffmpeg'))||!fs.existsSync(path.join(bin,'ffprobe')))return startupError('应用内的视频处理组件不完整，请重新安装。');
+ const agent=binary('episode-agent'),bin=binary('bin'),model=path.join(binary('models'),'ggml-base.bin');
+ if(!fs.existsSync(agent)||!fs.existsSync(path.join(bin,'ffmpeg'))||!fs.existsSync(path.join(bin,'ffprobe'))||!fs.existsSync(path.join(bin,'episode-ocr'))||!fs.existsSync(path.join(bin,'whisper-cli'))||!fs.existsSync(model))return startupError('应用内的视频、文字或语音识别组件不完整，请重新安装。');
  const port=await freePort();
- server=spawn(agent,['--port',String(port)],{env:{...process.env,PATH:bin+path.delimiter+(process.env.PATH||''),PYTHONUNBUFFERED:'1'},stdio:['ignore','pipe','pipe']});
+ server=spawn(agent,['--port',String(port)],{env:{...process.env,PATH:bin+path.delimiter+(process.env.PATH||''),EPISODE_WHISPER_MODEL:model,PYTHONUNBUFFERED:'1'},stdio:['ignore','pipe','pipe']});
  let output='',started=false;
  const timer=setTimeout(()=>{if(!started)startupError('视频处理组件启动超时。')},15000);
  server.stdout.on('data',chunk=>{
@@ -53,7 +53,7 @@ function createWindow(token,port){
 }
 ipcMain.handle('choose-path',async (_event,kind)=>{
  if(!window)return '';
- const choice=kind==='poster'?await dialog.showOpenDialog(window,{title:'选择纯净海报',properties:['openFile'],filters:[{name:'图片',extensions:['png','jpg','jpeg','webp']}]}):kind==='effect-audio'?await dialog.showOpenDialog(window,{title:'选择片尾音效',properties:['openFile'],filters:[{name:'音频',extensions:['mp3','wav','m4a','aac','flac']}]}):kind==='effect-visual'?await dialog.showOpenDialog(window,{title:'选择画面效果素材',properties:['openFile'],filters:[{name:'视频或图片',extensions:['png','webp','mp4','m4v','mov','webm']}]}):await dialog.showOpenDialog(window,{title:kind==='output'?'选择成片导出目录':'选择剧集目录',properties:['openDirectory']});
+ const choice=kind==='poster'?await dialog.showOpenDialog(window,{title:'选择纯净海报',properties:['openFile'],filters:[{name:'图片',extensions:['png','jpg','jpeg','webp']}]}):kind==='effect-audio'?await dialog.showOpenDialog(window,{title:'选择片尾音效',properties:['openFile'],filters:[{name:'音频',extensions:['mp3','wav','m4a','aac','flac']}]}):kind==='effect-visual'?await dialog.showOpenDialog(window,{title:'选择画面效果素材',properties:['openFile'],filters:[{name:'视频或图片',extensions:['png','webp','mp4','m4v','mov','webm']}]}):await dialog.showOpenDialog(window,{title:kind==='output'?'选择成片导出目录':kind==='srt-output'?'选择 SRT 导出目录':'选择剧集目录',properties:['openDirectory']});
  return choice.canceled?'':choice.filePaths[0];
 });
 app.on('before-quit',()=>{app.isQuitting=true;if(server)server.kill('SIGTERM')});

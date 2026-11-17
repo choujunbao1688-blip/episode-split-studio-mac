@@ -36,6 +36,14 @@ jobs:
           mkdir -p build/agent-dist
           cp dist/episode-agent build/agent-dist/episode-agent
           node scripts/prepare-binaries.js
+          swiftc -O -framework Vision -framework AppKit scripts/ocr.swift -o build/bin/episode-ocr
+          git clone --depth 1 --branch v1.9.5 https://github.com/ggml-org/whisper.cpp.git "$RUNNER_TEMP/whisper.cpp"
+          cmake -S "$RUNNER_TEMP/whisper.cpp" -B "$RUNNER_TEMP/whisper-build" -DCMAKE_BUILD_TYPE=Release -DBUILD_SHARED_LIBS=OFF -DGGML_METAL=OFF -DWHISPER_BUILD_TESTS=OFF
+          cmake --build "$RUNNER_TEMP/whisper-build" --target whisper-cli --parallel 4
+          cp "$RUNNER_TEMP/whisper-build/bin/whisper-cli" build/bin/whisper-cli
+          mkdir -p build/models
+          curl --fail --location --retry 3 --silent --show-error https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-base.bin -o build/models/ggml-base.bin
+          test "$(stat -f%z build/models/ggml-base.bin)" -gt 100000000
           build/bin/ffmpeg -version
           build/bin/ffprobe -version
           PATH="$PWD/build/bin:$PATH" build/agent-dist/episode-agent --help

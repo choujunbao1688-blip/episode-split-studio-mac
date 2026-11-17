@@ -5,6 +5,10 @@ from fractions import Fraction
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from PIL import Image, ImageDraw, ImageFont, ImageFilter, ImageChops, ImageStat, ImageOps
+try:
+ from . import text_clean
+except ImportError:
+ import text_clean
 
 VIDEO_EXT={'.mp4','.mov','.mkv','.m4v','.avi'}
 STATE={'files':[], 'plan':[], 'settings':{}, 'job':None, 'samples':{}, 'sampleCovers':{}, 'tailPreviews':{}, 'warnings':[], 'orderConfirmed':False}
@@ -353,7 +357,11 @@ def export_one(row,s,out,job=None):
  if s.get('coverEnabled',True) and not poster:raise ValueError('请先选择纯净海报，或关闭分集封面。')
  include_cover=bool(poster and s.get('coverEnabled',True));tail=bounded(s.get('tailDuration',2.8),2.8,.6,6) if s.get('tailEnabled',True) else 0
  style=s.get('tailStyle','warmflare') if s.get('tailStyle') in {'warmflare','flash','freeze','custom'} else 'warmflare'
- clip='fps=25,scale=1080:1920:force_original_aspect_ratio=decrease,pad=1080:1920:(ow-iw)/2:(oh-ih)/2,setsar=1,format=yuv420p'
+ clip='setpts=PTS-STARTPTS,fps=25,scale=1080:1920:force_original_aspect_ratio=decrease,pad=1080:1920:(ow-iw)/2:(oh-ih)/2,setsar=1,format=yuv420p'
+ if s.get('removeText',False):
+  text_events=text_clean.analyze_text(f['path'],s,CACHE)
+  filters=text_clean.delogo_filters(text_events,row,s)
+  if filters:clip+=','+','.join(filters)
  if tail:clip+=f',tpad=stop_mode=clone:stop_duration={tail}'
  if tail and s.get('zoomEnabled',False):clip+=','+zoom_filter(s,dur,tail)
  inputs=['-ss',str(start),'-t',str(dur),'-i',f['path']]
@@ -502,19 +510,45 @@ def export_episodes(rows,settings,out,progress):
   dest=out/f'{ep}.mp4'
   if dest.exists() and not export_stamp_matches_file(export_stamp_path(out,ep),dest):
    raise ValueError(f'{dest.name} 已存在且不是本任务已记录的导出文件；请更换输出目录或先移走该文件。')
+ srt_folder=None
+ if settings.get('exportSrt',False):
+  if not settings.get('srtFolder'):
+   raise ValueError('请单独选择 SRT 导出目录。')
+  srt_folder=safe_out(settings['srtFolder'])
+  if srt_folder==out:raise ValueError('SRT 目录必须与 MP4 目录分开。')
+  for ep in episodes:
+   dest=srt_folder/f'{ep}.srt'
+   if dest.exists() and not export_stamp_matches_file(export_stamp_path(srt_folder,ep),dest):
+    raise ValueError(f'{dest.name} 已存在且不是本任务已记录的字幕文件；请更换 SRT 目录或先移走该文件。')
  done=[]
  for i,row in enumerate(rows):
   ep=episodes[i];dest=out/f'{ep}.mp4';stamp=export_stamp_path(out,ep)
   progress(f'导出 {i+1}/{len(rows)} · EP{ep}',i/len(rows)*100)
   signature=render_signature(settings,[row])
+  reused=False
   if export_stamp_matches_file(stamp,dest):
    try:
     if json.loads(stamp.read_text(encoding='utf-8')).get('signature')==signature and probe(dest)['duration']>row['duration']-.5:
-     done.append(str(dest));continue
+     done.append(str(dest));reused=True
    except (OSError,ValueError,KeyError):pass
-  done.append(export_one(row,settings,dest))
-  record_export_stamp(stamp,dest,signature)
- return {'folder':str(out),'files':len(done)}
+  if not reused:
+   done.append(export_one(row,settings,dest))
+   record_export_stamp(stamp,dest,signature)
+  if srt_folder:
+   f=STATE['files'][row['source']]
+   events=text_clean.analyze_text(f['path'],settings,CACHE)
+   speech=text_clean.voice_segments(f['path'],CACHE,settings.get('language','en')) if f.get('audio',False) else []
+   cues=text_clean.subtitle_cues(events,speech,row,.8 if settings.get('coverEnabled',True) else 0)
+   srt_dest=srt_folder/f'{ep}.srt';srt_stamp=export_stamp_path(srt_folder,ep)
+   if not (export_stamp_matches_file(srt_stamp,srt_dest) and
+           json.loads(srt_stamp.read_text(encoding='utf-8')).get('signature')==signature):
+    temp=srt_dest.with_name(f'.{ep}.{secrets.token_hex(4)}.tmp')
+    try:
+     temp.write_text(text_clean.format_srt(cues),encoding='utf-8')
+     os.replace(temp,srt_dest)
+    finally:temp.unlink(missing_ok=True)
+    record_export_stamp(srt_stamp,srt_dest,signature)
+ return {'folder':str(out),'files':len(done),'srtFolder':str(srt_folder) if srt_folder else None}
 
 class Handler(BaseHTTPRequestHandler):
  def log_message(self,*args):pass
@@ -639,7 +673,13 @@ class Handler(BaseHTTPRequestHandler):
      if numbered:verify_sample_cover(out,numbered)
      STATE['samples'][ep]=result;STATE['sampleCovers'][ep]=str(numbered) if numbered else ''
      STATE['sampleSignature']=render_signature(STATE['settings']);progress('样片可播放',100)
-     return {'episode':ep,'url':f'/video?episode={ep}','coverUrl':f'/sample-cover?episode={ep}' if numbered else ''}
+     cues=[]
+     if STATE['settings'].get('exportSrt',False):
+      f=STATE['files'][row['source']]
+      events=text_clean.analyze_text(f['path'],STATE['settings'],CACHE)
+      speech=text_clean.voice_segments(f['path'],CACHE,STATE['settings'].get('language','en')) if f.get('audio',False) else []
+      cues=text_clean.subtitle_cues(events,speech,row,.8 if STATE['settings'].get('coverEnabled',True) else 0)
+     return {'episode':ep,'url':f'/video?episode={ep}','coverUrl':f'/sample-cover?episode={ep}' if numbered else '', 'cues':cues}
     self.respond(start_job('sample',task))
    elif path=='/tail-preview':
     with LOCK:STATE['settings'].update(data.get('settings',{}))

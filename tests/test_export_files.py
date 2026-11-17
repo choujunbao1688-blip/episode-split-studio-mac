@@ -59,6 +59,29 @@ class ExportFileTests(unittest.TestCase):
         self.assertEqual(existing.read_bytes(), b'keep me')
         self.assertFalse((self.output / '20.mp4').exists())
 
+    def test_srt_folder_is_separate_and_matches_episode_numbers(self):
+        from unittest.mock import patch
+        captions = self.root / 'captions'
+        events = [{'kind':'subtitle','start':1,'end':2,'text':'Hello there'}]
+
+        def render(row, settings, dest):
+            dest.write_bytes(b'video')
+            return str(dest)
+
+        for row in self.rows:
+            row['start'] = 0
+            row['end'] = 3
+            row['duration'] = 3
+        agent.STATE['files'][0]['audio'] = True
+        settings = {'exportSrt':True,'srtFolder':str(captions),'coverEnabled':True}
+        with patch.object(agent,'export_one',side_effect=render), \
+             patch.object(agent.text_clean,'analyze_text',return_value=events), \
+             patch.object(agent.text_clean,'voice_segments',return_value=[]):
+            agent.export_episodes(self.rows,settings,self.output,lambda *args:None)
+        self.assertEqual(sorted(p.name for p in self.output.iterdir()),['20.mp4','21.mp4'])
+        self.assertEqual(sorted(p.name for p in captions.iterdir()),['20.srt','21.srt'])
+        self.assertIn('00:00:01,800 --> 00:00:02,800',(captions/'20.srt').read_text())
+
 
 if __name__ == '__main__':
     unittest.main()

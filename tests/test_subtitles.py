@@ -1,3 +1,6 @@
+import re
+import shutil
+import subprocess
 import unittest
 
 from agent import text_clean
@@ -37,6 +40,29 @@ class SubtitleTests(unittest.TestCase):
         self.assertIn('delogo=x=',filters[0])
         self.assertEqual(text_clean.delogo_filters(events,{'start':20,'end':22},{}),[])
 
+    def test_delogo_never_touches_frame_edges(self):
+        # OCR may report a word beyond the edge or a name bar reaching the corner.
+        events = [
+            {'kind':'subtitle','start':0,'end':1,'x':-.02,'y':.3,'w':.3,'h':.04},
+            {'kind':'name','start':0,'end':1,'x':.95,'y':.95,'w':.2,'h':.1},
+            {'kind':'subtitle','start':0,'end':1,'x':1.15,'y':.5,'w':.2,'h':.02},
+        ]
+        filters = text_clean.delogo_filters(events,{'start':0,'end':1},{})
+        self.assertEqual(len(filters),2)
+        for item in filters:
+            x,y,w,h = map(int,re.search(r'delogo=x=(\d+):y=(\d+):w=(\d+):h=(\d+)',item).groups())
+            self.assertGreater(x,0)
+            self.assertGreater(y,0)
+            self.assertLess(x+w,1080)
+            self.assertLess(y+h,1920)
+        if shutil.which('ffmpeg'):
+            result = subprocess.run([
+                'ffmpeg','-hide_banner','-v','error','-f','lavfi','-i',
+                'color=s=1080x1920:r=1:d=1','-vf',','.join(filters),
+                '-frames:v','1','-f','null','-'
+            ],capture_output=True,text=True)
+            self.assertEqual(result.returncode,0,result.stderr)
+
     def test_merges_matching_frames_but_excludes_name_bar_from_srt(self):
         line = lambda text,y: {'text':text,'confidence':.94,'x':.12,'y':y,'w':.72,'h':.03}
         frames = [{'index':i,'lines':[line('That was my brother',.70),line('LUCIA',.32)]}
@@ -49,3 +75,4 @@ class SubtitleTests(unittest.TestCase):
 
 
 if __name__ == '__main__':unittest.main()
+

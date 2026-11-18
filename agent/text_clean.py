@@ -227,10 +227,13 @@ def delogo_filters(events, row, settings):
             continue
         pad_x = .012 if event['kind'] == 'subtitle' else .025
         pad_y = .008 if event['kind'] == 'subtitle' else .015
-        x = max(0, int((event['x']-pad_x)*1080))
-        y = max(0, int((event['y']-pad_y)*1920))
-        right = min(1080, int((event['x']+event['w']+pad_x)*1080))
-        bottom = min(1920, int((event['y']+event['h']+pad_y)*1920))
+        # FFmpeg delogo requires a strict interior rectangle: x > 0, y > 0,
+        # x + w < frame width, and y + h < frame height.
+        frame_w, frame_h, inset = 1080, 1920, 2
+        x = max(inset, min(frame_w-inset, int((event['x']-pad_x)*frame_w)))
+        y = max(inset, min(frame_h-inset, int((event['y']-pad_y)*frame_h)))
+        right = max(inset, min(frame_w-inset, int((event['x']+event['w']+pad_x)*frame_w)))
+        bottom = max(inset, min(frame_h-inset, int((event['y']+event['h']+pad_y)*frame_h)))
         if right-x < 8 or bottom-y < 8:
             continue
         a = max(0, event['start']-start-.3)

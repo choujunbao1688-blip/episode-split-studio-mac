@@ -39,12 +39,22 @@ jobs:
         run: |
           swiftc -O -framework Vision -framework AppKit scripts/ocr.swift -o build/bin/episode-ocr
           git clone --depth 1 --branch v1.9.5 https://github.com/ggml-org/whisper.cpp.git "$RUNNER_TEMP/whisper.cpp"
-          cmake -S "$RUNNER_TEMP/whisper.cpp" -B "$RUNNER_TEMP/whisper-build" -DCMAKE_BUILD_TYPE=Release -DBUILD_SHARED_LIBS=OFF -DGGML_METAL=OFF -DWHISPER_BUILD_TESTS=OFF
+          cmake -S "$RUNNER_TEMP/whisper.cpp" -B "$RUNNER_TEMP/whisper-build" -DCMAKE_BUILD_TYPE=Release -DBUILD_SHARED_LIBS=OFF -DGGML_METAL=ON -DGGML_METAL_EMBED_LIBRARY=ON -DWHISPER_BUILD_TESTS=OFF
           cmake --build "$RUNNER_TEMP/whisper-build" --target whisper-cli --parallel 4
           cp "$RUNNER_TEMP/whisper-build/bin/whisper-cli" build/bin/whisper-cli
           mkdir -p build/models
           curl --fail --location --retry 3 --silent --show-error https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-base.bin -o build/models/ggml-base.bin
           test "$(stat -f%z build/models/ggml-base.bin)" -gt 100000000
+          python - <<'PY'
+          import math, os, struct, wave
+          path=os.path.join(os.environ['RUNNER_TEMP'],'speech-smoke.wav')
+          with wave.open(path,'wb') as wav:
+              wav.setnchannels(1)
+              wav.setsampwidth(2)
+              wav.setframerate(16000)
+              wav.writeframes(b''.join(struct.pack('<h',int(500*math.sin(2*math.pi*440*i/16000))) for i in range(16000)))
+          PY
+          build/bin/whisper-cli -m build/models/ggml-base.bin -f "$RUNNER_TEMP/speech-smoke.wav" -l en -np -otxt -of "$RUNNER_TEMP/speech-smoke"
       - name: Check packaged FFmpeg media effects
         run: |
           PATH="$PWD/build/bin:$PATH" python -m unittest discover -s tests -p 'test_media_effects.py' -v
@@ -57,7 +67,7 @@ jobs:
             -c.mac.notarize=false \
             -c.mac.entitlements=build/entitlements.mac.adhoc.plist \
             -c.mac.entitlementsInherit=build/entitlements.mac.adhoc.inherit.plist \
-            -c.dmg.artifactName=episode-split-studio-0.1.7-beta.2-arm64-adhoc-test.dmg
+            -c.dmg.artifactName=episode-split-studio-0.1.7-beta.3-arm64-adhoc-test.dmg
       - name: Verify signature and engine startup
         run: |
           app="release/mac-arm64/拆集工作台.app"
@@ -71,13 +81,14 @@ jobs:
           assert result.returncode==0, f'Packaged app failed with exit code {result.returncode}'
           assert 'Packaged engine health check passed' in result.stdout
           PY
-          hdiutil verify release/episode-split-studio-0.1.7-beta.2-arm64-adhoc-test.dmg
+          hdiutil verify release/episode-split-studio-0.1.7-beta.3-arm64-adhoc-test.dmg
           mkdir -p "$RUNNER_TEMP/episode-mounted"
-          hdiutil attach -readonly -nobrowse -mountpoint "$RUNNER_TEMP/episode-mounted" release/episode-split-studio-0.1.7-beta.2-arm64-adhoc-test.dmg
+          hdiutil attach -readonly -nobrowse -mountpoint "$RUNNER_TEMP/episode-mounted" release/episode-split-studio-0.1.7-beta.3-arm64-adhoc-test.dmg
           codesign --verify --deep --strict --verbose=2 "$RUNNER_TEMP/episode-mounted/拆集工作台.app"
           hdiutil detach "$RUNNER_TEMP/episode-mounted"
       - uses: actions/upload-artifact@v4
         with:
-          name: episode-split-studio-arm64-adhoc-test-v017-beta2
-          path: release/episode-split-studio-0.1.7-beta.2-arm64-adhoc-test.dmg
+          name: episode-split-studio-arm64-adhoc-test-v017-beta3
+          path: release/episode-split-studio-0.1.7-beta.3-arm64-adhoc-test.dmg
           if-no-files-found: error
+

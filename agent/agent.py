@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
 """Episode Split Studio local processor. Python 3.10+, FFmpeg, Pillow."""
 import argparse, array, base64, hashlib, hmac, json, math, os, re, secrets, shutil, subprocess, sys, tempfile, threading, time, urllib.parse, wave
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from fractions import Fraction
+from functools import lru_cache
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from PIL import Image, ImageDraw, ImageFont, ImageFilter, ImageChops, ImageStat, ImageOps
@@ -186,6 +188,30 @@ def analyse(f):
   if all(abs(c['time']-x['time'])>2 for x in kept): kept.append(c)
  return sorted(kept,key=lambda x:x['time']),round(intro,2),round(tail,2)
 
+def analysis_cache_key(f, poster=''):
+ parts=[]
+ for path in (f['path'],poster):
+  if path:
+   q=Path(path);stat=q.stat()
+   parts.append((str(q.resolve()),stat.st_size,stat.st_mtime_ns))
+ return hashlib.sha256(json.dumps([4,parts,f.get('duration'),f.get('fps')]).encode()).hexdigest()
+
+def cached_analyse(f):
+ folder=CACHE/'analysis';folder.mkdir(parents=True,exist_ok=True)
+ path=folder/f'{analysis_cache_key(f)}.json'
+ if path.is_file():
+  try:
+   data=json.loads(path.read_text(encoding='utf-8'))
+   if len(data)==3:return data[0],data[1],data[2]
+  except (OSError,ValueError,TypeError):pass
+ result=analyse(f)
+ temp=folder/f'.{secrets.token_hex(8)}.tmp'
+ try:
+  temp.write_text(json.dumps(result),encoding='utf-8')
+  os.replace(temp,path)
+ finally:temp.unlink(missing_ok=True)
+ return result
+
 def detect_intro_cover_frames(f,poster,max_seconds=4):
  """Compare native source frames to the selected clean poster, including one-frame covers."""
  if not poster:return 0
@@ -206,6 +232,21 @@ def detect_intro_cover_frames(f,poster,max_seconds=4):
   matches+=1
  return matches
 
+def cached_intro_cover_frames(f,poster):
+ if not poster:return 0
+ folder=CACHE/'poster-analysis';folder.mkdir(parents=True,exist_ok=True)
+ path=folder/f'{analysis_cache_key(f,poster)}.json'
+ if path.is_file():
+  try:return int(json.loads(path.read_text(encoding='utf-8')))
+  except (OSError,ValueError,TypeError):pass
+ count=detect_intro_cover_frames(f,poster)
+ temp=folder/f'.{secrets.token_hex(8)}.tmp'
+ try:
+  temp.write_text(json.dumps(count),encoding='utf-8')
+  os.replace(temp,path)
+ finally:temp.unlink(missing_ok=True)
+ return count
+
 def story_cuts(cands,start,end,minlen,maxlen,threshold=2.45):
  """Keep source boundaries and split only at a strong eligible content cue."""
  out=[];left=start
@@ -222,23 +263,28 @@ def plan_key(settings):
  return {name:settings.get(name) for name in PLAN_FIELDS}
 
 def plan(settings, progress):
- with LOCK: files=list(STATE['files']);confirmed=STATE.get('orderConfirmed',False)
+ with LOCK:
+  files=list(STATE['files']);confirmed=STATE.get('orderConfirmed',False);poster=STATE.get('poster')
  if not files: raise ValueError('请先导入剧集。')
  if not confirmed:raise ValueError('请先在导入页确认原集顺序。')
  minlen=max(10,float(settings.get('minSeconds',45)));maxlen=max(minlen,float(settings.get('maxSeconds',60)))
  target=max(1,int(settings.get('target',len(files))))
- analyses=[]
- for i,f in enumerate(files):
-  progress(f'分析 {i+1}/{len(files)} · {f["name"]}',(i+1)/(len(files)+1)*75)
-  candidates,intro,end=analyse(f)
+ def analyze_source(f):
+  candidates,intro,end=cached_analyse(f)
   if not settings.get('removeOld',True):intro=0;end=f['duration']
   fps=float(f.get('fps') or probe(f['path'])['fps'])
-  cover_frames=detect_intro_cover_frames(f,STATE.get('poster')) if settings.get('autoRemoveIntroCover',True) else 0
+  cover_frames=cached_intro_cover_frames(f,poster) if settings.get('autoRemoveIntroCover',True) else 0
   frame_skip=max(0,int(settings.get('trimIntroFrames',0)),int(f.get('headTrimFrames',0)))
   intro=max(intro,cover_frames/fps,frame_skip/fps,float(settings.get('trimIntroSeconds',0)))
   if float(f.get('tailTrim',0))>0:end=min(end,f['duration']-float(f['tailTrim']))
   if end-intro<4:end=f['duration'];intro=0
-  analyses.append((candidates,intro,end))
+  return candidates,intro,end
+ analyses=[None]*len(files)
+ with ThreadPoolExecutor(max_workers=min(2,len(files))) as pool:
+  futures={pool.submit(analyze_source,f):i for i,f in enumerate(files)}
+  for completed,future in enumerate(as_completed(futures),1):
+   i=futures[future];analyses[i]=future.result()
+   progress(f'已分析 {completed}/{len(files)} · {files[i]["name"]}',completed/len(files)*75)
  rows=[]; startnum=max(1,int(settings.get('startEpisode',1)))
  threshold=2.45 if target>len(files) else 2.7
  for i,(f,(cands,intro,end)) in enumerate(zip(files,analyses)):
@@ -337,8 +383,7 @@ def zoom_filter(settings,duration,tail):
  else:expression=f'{start}+({end-start})*{progress(initial,total)}'
  return f"zoompan=z='{expression}':x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':d=1:s=1080x1920:fps=25"
 
-def render_signature(settings,rows=None):
- rows=rows if rows is not None else STATE['plan']
+def render_assets(settings):
  assets=[]
  for p in [STATE.get('poster') if settings.get('coverEnabled',True) else None,
            settings.get('tailAudioPath') if settings.get('tailEnabled',True) else None,
@@ -347,7 +392,30 @@ def render_signature(settings,rows=None):
    q=Path(p);assets.append((str(q),q.stat().st_size,q.stat().st_mtime_ns))
  for f in STATE['files']:
   q=Path(f['path']);assets.append((str(q),q.stat().st_size,q.stat().st_mtime_ns))
+ return assets
+
+def render_signature(settings,rows=None,assets=None):
+ rows=rows if rows is not None else STATE['plan']
+ if assets is None:assets=render_assets(settings)
  return hashlib.sha256(json.dumps([rows,settings,assets],sort_keys=True,ensure_ascii=False).encode()).hexdigest()
+
+@lru_cache(maxsize=1)
+def hardware_encoder_available():
+ try:
+  encoders=run(['ffmpeg','-hide_banner','-encoders'],timeout=15)
+  return bool(re.search(r'^\s*V\S*\s+h264_videotoolbox\b',encoders,re.M))
+ except (OSError,RuntimeError,subprocess.TimeoutExpired):return False
+
+def video_encoder_candidates(settings):
+ if settings.get('encodingMode','fast')=='quality':
+  return [['-c:v','libx264','-preset',settings.get('preset','medium'),
+           '-crf',str(settings.get('crf',19))]]
+ software=['-c:v','libx264','-preset',settings.get('preset','veryfast'),
+           '-crf',str(settings.get('crf',18))]
+ if hardware_encoder_available():
+  return [['-c:v','h264_videotoolbox','-b:v','12M',
+           '-maxrate','16M','-bufsize','24M'],software]
+ return [software]
 
 def export_one(row,s,out,job=None):
  f=STATE['files'][row['source']];start=float(row['start']);dur=float(row['end'])-start
@@ -436,9 +504,17 @@ def export_one(row,s,out,job=None):
  else:vf,af=video,'[aclip]'
  out.parent.mkdir(parents=True,exist_ok=True)
  tmp=out.with_name(f'.{out.stem}.{secrets.token_hex(4)}.part.mp4')
- cmd=['ffmpeg','-y','-nostdin','-hide_banner','-loglevel','error',*inputs,'-filter_complex',';'.join(filters),'-map',vf,'-map',af,'-c:v','libx264','-preset',s.get('preset','medium'),'-crf',str(s.get('crf',19)),'-pix_fmt','yuv420p','-r','25','-c:a','aac','-b:a','192k','-ac','2','-ar','48000','-movflags','+faststart',str(tmp)]
+ cmd=['ffmpeg','-y','-nostdin','-hide_banner','-loglevel','error',*inputs,'-filter_complex',';'.join(filters),'-map',vf,'-map',af]
+ output_options=['-pix_fmt','yuv420p','-r','25','-c:a','aac','-b:a','192k','-ac','2','-ar','48000','-movflags','+faststart',str(tmp)]
  try:
-  run(cmd)
+  candidates=video_encoder_candidates(s)
+  for index,encoder in enumerate(candidates):
+   try:
+    run([*cmd,*encoder,*output_options])
+    break
+   except RuntimeError:
+    tmp.unlink(missing_ok=True)
+    if index==len(candidates)-1:raise
   os.replace(tmp,out)
  finally:tmp.unlink(missing_ok=True)
  return str(out)
@@ -520,34 +596,44 @@ def export_episodes(rows,settings,out,progress):
    dest=srt_folder/f'{ep}.srt'
    if dest.exists() and not export_stamp_matches_file(export_stamp_path(srt_folder,ep),dest):
     raise ValueError(f'{dest.name} 已存在且不是本任务已记录的字幕文件；请更换 SRT 目录或先移走该文件。')
- done=[]
+ done=[];assets=render_assets(settings);started=time.monotonic()
  for i,row in enumerate(rows):
   ep=episodes[i];dest=out/f'{ep}.mp4';stamp=export_stamp_path(out,ep)
-  progress(f'导出 {i+1}/{len(rows)} · EP{ep}',i/len(rows)*100)
-  signature=render_signature(settings,[row])
+  remaining=round((time.monotonic()-started)/i*(len(rows)-i)/60) if i else None
+  estimate=f' · 粗略剩余 {remaining} 分钟' if remaining is not None else ''
+  progress(f'视频 {i+1}/{len(rows)} · EP{ep}{estimate}',i/len(rows)*100)
+  signature=render_signature(settings,[row],assets)
+  valid_signatures={signature}
+  # Keep resumable beta.2 renders when the user explicitly selects the
+  # unchanged software quality mode; fast mode produces a different encode.
+  if settings.get('encodingMode')=='quality':
+   old_settings=dict(settings);old_settings.pop('encodingMode',None)
+   valid_signatures.add(render_signature(old_settings,[row],assets))
   reused=False
   if export_stamp_matches_file(stamp,dest):
    try:
-    if json.loads(stamp.read_text(encoding='utf-8')).get('signature')==signature and probe(dest)['duration']>row['duration']-.5:
+    if json.loads(stamp.read_text(encoding='utf-8')).get('signature') in valid_signatures and probe(dest)['duration']>row['duration']-.5:
      done.append(str(dest));reused=True
    except (OSError,ValueError,KeyError):pass
   if not reused:
    done.append(export_one(row,settings,dest))
    record_export_stamp(stamp,dest,signature)
   if srt_folder:
-   f=STATE['files'][row['source']]
-   events=text_clean.analyze_text(f['path'],settings,CACHE)
-   speech=text_clean.voice_segments(f['path'],CACHE,settings.get('language','en')) if f.get('audio',False) else []
-   cues=text_clean.subtitle_cues(events,speech,row,.8 if settings.get('coverEnabled',True) else 0)
+   progress(f'字幕 {i+1}/{len(rows)} · EP{ep}',(i+.7)/len(rows)*100)
    srt_dest=srt_folder/f'{ep}.srt';srt_stamp=export_stamp_path(srt_folder,ep)
    if not (export_stamp_matches_file(srt_stamp,srt_dest) and
-           json.loads(srt_stamp.read_text(encoding='utf-8')).get('signature')==signature):
+           json.loads(srt_stamp.read_text(encoding='utf-8')).get('signature') in valid_signatures):
+    f=STATE['files'][row['source']]
+    events=text_clean.analyze_text(f['path'],settings,CACHE)
+    speech=text_clean.voice_segments(f['path'],CACHE,settings.get('language','en')) if f.get('audio',False) else []
+    cues=text_clean.subtitle_cues(events,speech,row,.8 if settings.get('coverEnabled',True) else 0)
     temp=srt_dest.with_name(f'.{ep}.{secrets.token_hex(4)}.tmp')
     try:
      temp.write_text(text_clean.format_srt(cues),encoding='utf-8')
      os.replace(temp,srt_dest)
     finally:temp.unlink(missing_ok=True)
     record_export_stamp(srt_stamp,srt_dest,signature)
+  progress(f'已完成 {i+1}/{len(rows)} · EP{ep}',(i+1)/len(rows)*100)
  return {'folder':str(out),'files':len(done),'srtFolder':str(srt_folder) if srt_folder else None}
 
 class Handler(BaseHTTPRequestHandler):
@@ -715,3 +801,4 @@ def main():
  print(f'\n拆集工作台本机助手已启动。\n连接地址：http://127.0.0.1:{args.port}\n连接码：{TOKEN}\n保持此窗口打开；关闭窗口会停止本机处理。\n',flush=True)
  ThreadingHTTPServer(('127.0.0.1',args.port),Handler).serve_forever()
 if __name__=='__main__':main()
+

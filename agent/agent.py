@@ -577,10 +577,61 @@ def record_export_stamp(stamp,dest,signature):
   os.replace(name,stamp)
  finally:Path(name).unlink(missing_ok=True)
 
-def export_episodes(rows,settings,out,progress):
+def checked_episodes(rows):
  episodes=[int(row['episode']) for row in rows]
+ if not episodes:raise ValueError('请先生成拆集方案')
  if any(ep<1 for ep in episodes) or len(set(episodes))!=len(episodes):
   raise ValueError('导出集号必须为不重复的正整数。')
+ return episodes
+
+def validate_srt_folder(rows,folder):
+ for ep in checked_episodes(rows):
+  dest=folder/f'{ep}.srt'
+  if dest.exists() and not export_stamp_matches_file(export_stamp_path(folder,ep),dest):
+   raise ValueError(f'{dest.name} 已存在且不是本任务已记录的字幕文件；请更换 SRT 目录或先移走该文件。')
+
+def subtitle_signature(row,settings):
+ source=Path(STATE['files'][row['source']]['path'])
+ stat=source.stat()
+ fields={key:settings.get(key,default) for key,default in (
+  ('language','en'),('subtitleTopPct',58),('subtitleBottomPct',85),
+  ('nameTopPct',15),('nameBottomPct',58),('removeNameBars',True),
+  ('coverEnabled',True))}
+ payload=['srt-v1',row,fields,str(source.resolve()),stat.st_size,stat.st_mtime_ns]
+ return hashlib.sha256(json.dumps(payload,sort_keys=True,ensure_ascii=False).encode()).hexdigest()
+
+def write_srt(row,settings,folder,compatible_signatures=()):
+ ep=int(row['episode']);dest=folder/f'{ep}.srt';stamp=export_stamp_path(folder,ep)
+ signature=subtitle_signature(row,settings)
+ if export_stamp_matches_file(stamp,dest):
+  try:
+   if json.loads(stamp.read_text(encoding='utf-8')).get('signature') in set(compatible_signatures)|{signature}:
+    return False
+  except (OSError,ValueError,TypeError):pass
+ f=STATE['files'][row['source']]
+ events=text_clean.analyze_text(f['path'],settings,CACHE)
+ speech=text_clean.voice_segments(f['path'],CACHE,settings.get('language','en')) if f.get('audio',False) else []
+ cues=text_clean.subtitle_cues(events,speech,row,.8 if settings.get('coverEnabled',True) else 0)
+ temp=dest.with_name(f'.{ep}.{secrets.token_hex(4)}.tmp')
+ try:
+  temp.write_text(text_clean.format_srt(cues),encoding='utf-8')
+  os.replace(temp,dest)
+ finally:temp.unlink(missing_ok=True)
+ record_export_stamp(stamp,dest,signature)
+ return True
+
+def export_srt_only(rows,settings,folder,progress):
+ checked_episodes(rows)
+ validate_srt_folder(rows,folder)
+ written=0
+ for i,row in enumerate(rows):
+  progress(f'仅导出 SRT {i+1}/{len(rows)} · EP{row["episode"]}',i/len(rows)*100)
+  written+=write_srt(row,settings,folder)
+  progress(f'已完成字幕 {i+1}/{len(rows)} · EP{row["episode"]}',(i+1)/len(rows)*100)
+ return {'folder':str(folder),'files':len(rows),'written':written}
+
+def export_episodes(rows,settings,out,progress):
+ episodes=checked_episodes(rows)
  # Pure numeric names could collide with unrelated source footage in this folder.
  for ep in episodes:
   dest=out/f'{ep}.mp4'
@@ -592,10 +643,7 @@ def export_episodes(rows,settings,out,progress):
    raise ValueError('请单独选择 SRT 导出目录。')
   srt_folder=safe_out(settings['srtFolder'])
   if srt_folder==out:raise ValueError('SRT 目录必须与 MP4 目录分开。')
-  for ep in episodes:
-   dest=srt_folder/f'{ep}.srt'
-   if dest.exists() and not export_stamp_matches_file(export_stamp_path(srt_folder,ep),dest):
-    raise ValueError(f'{dest.name} 已存在且不是本任务已记录的字幕文件；请更换 SRT 目录或先移走该文件。')
+  validate_srt_folder(rows,srt_folder)
  done=[];assets=render_assets(settings);started=time.monotonic()
  for i,row in enumerate(rows):
   ep=episodes[i];dest=out/f'{ep}.mp4';stamp=export_stamp_path(out,ep)
@@ -620,19 +668,7 @@ def export_episodes(rows,settings,out,progress):
    record_export_stamp(stamp,dest,signature)
   if srt_folder:
    progress(f'字幕 {i+1}/{len(rows)} · EP{ep}',(i+.7)/len(rows)*100)
-   srt_dest=srt_folder/f'{ep}.srt';srt_stamp=export_stamp_path(srt_folder,ep)
-   if not (export_stamp_matches_file(srt_stamp,srt_dest) and
-           json.loads(srt_stamp.read_text(encoding='utf-8')).get('signature') in valid_signatures):
-    f=STATE['files'][row['source']]
-    events=text_clean.analyze_text(f['path'],settings,CACHE)
-    speech=text_clean.voice_segments(f['path'],CACHE,settings.get('language','en')) if f.get('audio',False) else []
-    cues=text_clean.subtitle_cues(events,speech,row,.8 if settings.get('coverEnabled',True) else 0)
-    temp=srt_dest.with_name(f'.{ep}.{secrets.token_hex(4)}.tmp')
-    try:
-     temp.write_text(text_clean.format_srt(cues),encoding='utf-8')
-     os.replace(temp,srt_dest)
-    finally:temp.unlink(missing_ok=True)
-    record_export_stamp(srt_stamp,srt_dest,signature)
+   write_srt(row,settings,srt_folder,valid_signatures)
   progress(f'已完成 {i+1}/{len(rows)} · EP{ep}',(i+1)/len(rows)*100)
  return {'folder':str(out),'files':len(done),'srtFolder':str(srt_folder) if srt_folder else None}
 
@@ -791,6 +827,17 @@ class Handler(BaseHTTPRequestHandler):
     if STATE.get('sampleSignature')!=render_signature(settings,rows):raise ValueError('封面、切点、源文件或片尾设置已变化，请重新生成样片。')
     if shutil.disk_usage(out).free < sum(f['size'] for f in STATE['files'])*.8:raise ValueError('输出磁盘空间不足，请更换目录或清理空间。')
     self.respond(start_job('export',lambda progress:export_episodes(rows,settings,out,progress)))
+   elif path=='/export-srt':
+    with LOCK:STATE['settings'].update(data.get('settings',{}))
+    if STATE.get('planParams')!=plan_key(STATE['settings']):raise ValueError('分集设定已更改，请重新分析剧情并生成切点。')
+    rows=list(STATE['plan']);settings=dict(STATE['settings'])
+    if not rows:raise ValueError('请先生成拆集方案')
+    if not data.get('folder'):raise ValueError('请单独选择 SRT 导出目录。')
+    folder=safe_out(data['folder'])
+    if data.get('videoFolder') and folder==Path(data['videoFolder']).expanduser().resolve():
+     raise ValueError('SRT 目录必须与 MP4 目录分开。')
+    persist()
+    self.respond(start_job('export-srt',lambda progress:export_srt_only(rows,settings,folder,progress)))
    else:self.respond({'error':'未知路径'},404)
   except Exception as e:self.respond({'error':str(e)},403 if isinstance(e,PermissionError) else 400)
 

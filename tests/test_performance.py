@@ -142,5 +142,66 @@ class PerformanceTests(unittest.TestCase):
                 agent.STATE.clear()
                 agent.STATE.update(old_state)
 
+    def test_srt_only_writes_numbered_subtitles_without_mp4_or_sample(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root=Path(directory)
+            source=root/'source.mp4'
+            source.write_bytes(b'video')
+            folder=root/'nas-srt'
+            folder.mkdir()
+            rows=[{'episode':20,'source':0,'start':10,'end':12,'duration':2},
+                  {'episode':21,'source':0,'start':12,'end':14,'duration':2}]
+            settings={'language':'en','coverEnabled':True,'exportSrt':False}
+            old_cache,old_state=agent.CACHE,dict(agent.STATE)
+            agent.CACHE=root/'cache'
+            agent.CACHE.mkdir()
+            agent.STATE.update(files=[{'path':str(source),'audio':True}],poster='')
+            events=[
+                {'kind':'subtitle','start':10,'end':11,'text':'Hello','x':.2,'y':.7,'w':.6,'h':.03},
+                {'kind':'name','start':10,'end':12,'text':'LUCIA','x':.1,'y':.2,'w':.3,'h':.03},
+            ]
+            speech=[{'start':10,'end':11,'text':'Hello'},{'start':12,'end':13,'text':'Goodbye'}]
+            try:
+                with patch.object(agent.text_clean,'analyze_text',return_value=events) as ocr,patch.object(
+                        agent.text_clean,'voice_segments',return_value=speech) as voice,patch.object(
+                        agent,'export_one',side_effect=AssertionError('SRT-only must never encode video')):
+                    result=agent.export_srt_only(rows,settings,folder,lambda *_:None)
+                    self.assertEqual(result['written'],2)
+                    self.assertIn('00:00:00,800', (folder/'20.srt').read_text())
+                    self.assertIn('Goodbye',(folder/'21.srt').read_text())
+                    self.assertNotIn('LUCIA',(folder/'20.srt').read_text())
+                    self.assertEqual(list(folder.glob('*.mp4')),[])
+                    second=agent.export_srt_only(rows,settings,folder,lambda *_:None)
+                    self.assertEqual(second['written'],0)
+                    self.assertEqual(ocr.call_count,2)
+                    self.assertEqual(voice.call_count,2)
+            finally:
+                agent.CACHE=old_cache
+                agent.STATE.clear()
+                agent.STATE.update(old_state)
+
+    def test_srt_only_protects_unrelated_existing_subtitle(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root=Path(directory)
+            source=root/'source.mp4'
+            source.write_bytes(b'video')
+            folder=root/'srt'
+            folder.mkdir()
+            existing=folder/'20.srt'
+            existing.write_text('unrelated subtitle')
+            old_cache,old_state=agent.CACHE,dict(agent.STATE)
+            agent.CACHE=root/'cache'
+            agent.CACHE.mkdir()
+            agent.STATE.update(files=[{'path':str(source),'audio':False}],poster='')
+            try:
+                with self.assertRaisesRegex(ValueError,'不是本任务'):
+                    agent.export_srt_only([{'episode':20,'source':0,'start':0,'end':1}],
+                                          {'coverEnabled':False},folder,lambda *_:None)
+                self.assertEqual(existing.read_text(),'unrelated subtitle')
+            finally:
+                agent.CACHE=old_cache
+                agent.STATE.clear()
+                agent.STATE.update(old_state)
+
 
 if __name__=='__main__':unittest.main()

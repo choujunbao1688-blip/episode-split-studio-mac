@@ -27,6 +27,7 @@ def bounds(settings, kind):
 def source_key(path, settings):
     stat = Path(path).stat()
     fields = [str(Path(path).resolve()), stat.st_size, stat.st_mtime_ns,
+              settings.get('language','en'),
               *bounds(settings, 'subtitle'), *bounds(settings, 'name'),
               bool(settings.get('removeNameBars', True)), SAMPLE_INTERVAL, 3]
     return hashlib.sha256(json.dumps(fields).encode()).hexdigest()

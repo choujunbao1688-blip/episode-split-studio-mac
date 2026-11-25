@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Episode Split Studio local processor. Python 3.10+, FFmpeg, Pillow."""
-import argparse, array, base64, hashlib, hmac, json, math, os, re, secrets, shutil, subprocess, sys, tempfile, threading, time, urllib.parse, wave
+import argparse, array, base64, copy, hashlib, hmac, json, math, os, re, secrets, shutil, subprocess, sys, tempfile, threading, time, urllib.parse, wave
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from fractions import Fraction
 from functools import lru_cache
@@ -14,12 +14,13 @@ except ImportError:
 
 VIDEO_EXT={'.mp4','.mov','.mkv','.m4v','.avi'}
 STATE={'files':[], 'plan':[], 'settings':{}, 'job':None, 'samples':{}, 'sampleCovers':{}, 'tailPreviews':{}, 'warnings':[], 'orderConfirmed':False}
-PLAN_FIELDS=('target','startEpisode','minSeconds','maxSeconds','language','removeOld','trimIntroSeconds','trimIntroFrames','autoRemoveIntroCover')
+PLAN_FIELDS=('target','startEpisode','minSeconds','maxSeconds','removeOld','trimIntroSeconds','trimIntroFrames','autoRemoveIntroCover')
 LOCK=threading.RLock()
 TOKEN=secrets.token_urlsafe(18)
 HOME=Path.home()
 CACHE=HOME/'.episode-split-studio'
 CACHE.mkdir(exist_ok=True)
+def history_path():return CACHE/'history.json'
 FONT_DIR=Path(__file__).parent/'fonts'
 FONT_CHOICES={
  'Libre Baskerville':[FONT_DIR/'DejaVuSerif-BoldItalic.ttf','/System/Library/Fonts/Supplemental/Times New Roman Bold Italic.ttf'],
@@ -91,6 +92,8 @@ def visual_has_alpha(path):
  return any(x in pix for x in ('yuva','rgba','bgra','argb','abgr','gbrap'))
 
 def scan(folder,poster):
+ with LOCK:
+  if STATE.get('job') and STATE['job']['status']=='running':raise ValueError('任务运行中，暂不能重新导入素材。')
  root=Path(folder).expanduser().resolve()
  if not root.is_dir(): raise ValueError('剧集目录不存在。NAS 请先在电脑上挂载，再输入挂载目录。')
  paths=sorted((p for p in root.iterdir() if p.is_file() and p.suffix.lower() in VIDEO_EXT),key=sortkey)
@@ -105,13 +108,136 @@ def scan(folder,poster):
  if numbers and len(numbers)==len(files) and max(numbers)-min(numbers)+1!=len(set(numbers)): warnings.append('源文件编号存在缺集或重复。')
  for i,f in enumerate(files):f['sourceOrdinal']=i+1
  poster_path=checked_poster(poster)
- with LOCK: STATE.update(files=files,poster=poster_path,plan=[],planParams=None,warnings=warnings,orderConfirmed=True,sourceOrderMode='auto',samples={},sampleCovers={},sampleSignature=None)
+ previous=load_history().get('analysis')
+ reused=bool(previous and len(previous.get('files',[]))==len(files)
+             and {f['path'] for f in previous['files']}=={f['path'] for f in files}
+             and snapshot_valid(previous)
+             and (not previous.get('planParams',{}).get('autoRemoveIntroCover')
+                  or previous.get('poster')==poster_path))
+ if reused:
+  files=previous['files']
+  with LOCK:
+   if STATE.get('job') and STATE['job']['status']=='running':raise ValueError('任务运行中，暂不能重新导入素材。')
+   STATE.update(files=files,poster=poster_path,plan=previous['plan'],planParams=previous['planParams'],planFingerprints=previous['fingerprints'],posterFingerprint=previous.get('posterFingerprint'),settings=previous['settings'],warnings=warnings,orderConfirmed=True,sourceOrderMode=previous.get('sourceOrderMode','auto'),samples={},sampleCovers={},sampleSignature=None)
+ else:
+  with LOCK:
+   if STATE.get('job') and STATE['job']['status']=='running':raise ValueError('任务运行中，暂不能重新导入素材。')
+   STATE.update(files=files,poster=poster_path,plan=[],planParams=None,planFingerprints=None,posterFingerprint=None,warnings=warnings,orderConfirmed=True,sourceOrderMode='auto',samples={},sampleCovers={},sampleSignature=None)
  persist()
- return {'files':files,'warnings':warnings,'duration':sum(f['duration'] for f in files),'size':sum(f['size'] for f in files)}
+ return {'files':files,'warnings':warnings,'duration':sum(f['duration'] for f in files),'size':sum(f['size'] for f in files),'reused':reused,'plan':STATE['plan'] if reused else [],'settings':STATE['settings'] if reused else {}}
+
+def file_fingerprint(path):
+ p=Path(path);stat=p.stat()
+ return {'path':str(p.resolve()),'size':stat.st_size,'mtimeNs':stat.st_mtime_ns}
+
+def plan_fingerprints(files):
+ return [file_fingerprint(f['path']) for f in files]
+
+def snapshot_valid(snapshot):
+ try:
+  files=snapshot['files'];fingerprints=snapshot['fingerprints']
+  if not files or len(files)!=len(fingerprints) or plan_fingerprints(files)!=fingerprints:return False
+  if snapshot.get('planParams',{}).get('autoRemoveIntroCover'):
+   actual=file_fingerprint(snapshot['poster']) if snapshot.get('poster') else None
+   return actual==snapshot.get('posterFingerprint')
+  return True
+ except (KeyError,OSError,ValueError,TypeError):return False
+
+def atomic_json(path,payload):
+ path.parent.mkdir(parents=True,exist_ok=True)
+ fd,name=tempfile.mkstemp(prefix='record-',suffix='.tmp',dir=path.parent)
+ try:
+  with os.fdopen(fd,'w',encoding='utf-8') as output:
+   json.dump(payload,output,ensure_ascii=False)
+   output.flush();os.fsync(output.fileno())
+  os.replace(name,path)
+ finally:Path(name).unlink(missing_ok=True)
+
+def load_history():
+ try:
+  data=json.loads(history_path().read_text(encoding='utf-8'))
+  return data if isinstance(data,dict) else {}
+ except (OSError,ValueError,TypeError):return {}
+
+def analysis_snapshot():
+ with LOCK:
+  return {k:copy.deepcopy(STATE.get(k)) for k in ('files','poster','plan','planParams','planFingerprints','posterFingerprint','settings','sourceOrderMode')}
+
+def save_analysis_history():
+ with LOCK:
+  history=load_history()
+  snapshot=analysis_snapshot()
+  snapshot['fingerprints']=snapshot.pop('planFingerprints')
+  snapshot['updatedAt']=time.time()
+  history['analysis']=snapshot
+  atomic_json(history_path(),history)
+
+def require_current_plan(settings):
+ with LOCK:
+  if not STATE.get('plan'):raise ValueError('请先生成拆集方案')
+  if STATE.get('planParams')!=plan_key(settings):raise ValueError('分集条件已更改，请重新生成切点。')
+  snapshot={'files':STATE['files'],'fingerprints':STATE.get('planFingerprints'),
+            'poster':STATE.get('poster'),'posterFingerprint':STATE.get('posterFingerprint'),
+            'planParams':STATE['planParams']}
+  if not snapshot_valid(snapshot):raise ValueError('源片或海报已变化、或 NAS 未挂载；请核查素材后重新分析。最近记录仍保留。')
+
+def visible_history():
+ with LOCK:history=load_history()
+ analysis=history.get('analysis')
+ if analysis:
+  analysis=copy.deepcopy(analysis)
+  analysis['available']=snapshot_valid(analysis)
+ record=history.get('export')
+ if record:
+  record=copy.deepcopy(record)
+  record['analysisAvailable']=snapshot_valid(record.get('analysis') or {})
+  for run in record.get('runs',{}).values():
+   run['folderAvailable']=Path(run.get('folder','')).is_dir() if run.get('folder') else False
+   for item in run.get('files',[]):item['available']=Path(item['path']).is_file()
+ return {'analysis':analysis,'export':record}
+
+def begin_export_history(mode,folder,rows,settings):
+ with LOCK:
+  history=load_history();analysis=history.get('analysis')
+  if not analysis or analysis.get('plan')!=rows:
+   save_analysis_history();history=load_history();analysis=history['analysis']
+  key=hashlib.sha256(json.dumps([analysis['fingerprints'],analysis['files'],analysis['planParams'],analysis.get('posterFingerprint'),rows],sort_keys=True).encode()).hexdigest()
+  record=history.get('export') or {}
+  if record.get('analysisKey')!=key:record={'analysisKey':key,'runs':{},'updatedAt':time.time()}
+  record['analysis']=analysis
+  record['runs'][mode]={'folder':str(folder),'status':'running','files':[],
+                        'settings':copy.deepcopy(settings),'updatedAt':time.time()}
+  record['updatedAt']=time.time()
+  history['export']=record;atomic_json(history_path(),history)
+
+def record_export_file(mode,episode,path):
+ with LOCK:
+  history=load_history();record=history.get('export')
+  if not record or mode not in record.get('runs',{}):return
+  run=record['runs'][mode];run['files']=[x for x in run['files'] if x['episode']!=episode]
+  run['files'].append({'episode':episode,'path':str(path)})
+  run['files'].sort(key=lambda x:x['episode']);run['updatedAt']=record['updatedAt']=time.time()
+  atomic_json(history_path(),history)
+
+def finish_export_history(mode,status,error=''):
+ with LOCK:
+  history=load_history();record=history.get('export')
+  if not record or mode not in record.get('runs',{}):return
+  run=record['runs'][mode];run.update(status=status,error=error,updatedAt=time.time())
+  record['updatedAt']=time.time();atomic_json(history_path(),history)
+
+def tracked_export(modes,rows,settings,task):
+ for mode,folder in modes:begin_export_history(mode,folder,rows,settings)
+ try:result=task()
+ except Exception as exc:
+  for mode,_ in modes:finish_export_history(mode,'error',str(exc))
+  raise
+ for mode,_ in modes:finish_export_history(mode,'done')
+ return result
 
 def persist():
  with LOCK:
-  data={k:STATE.get(k) for k in ('files','poster','plan','planParams','settings','warnings','orderConfirmed','sourceOrderMode')}
+  data={k:STATE.get(k) for k in ('files','poster','plan','planParams','planFingerprints','posterFingerprint','settings','warnings','orderConfirmed','sourceOrderMode')}
   CACHE.mkdir(parents=True,exist_ok=True)
   fd,name=tempfile.mkstemp(prefix='state-',suffix='.tmp',dir=CACHE)
   try:
@@ -125,9 +251,11 @@ def persist():
 def restore():
  try:
   d=json.loads((CACHE/'state.json').read_text())
-  if all(Path(f['path']).exists() for f in d.get('files',[])):
-   if d.get('plan') and any(k not in (d.get('planParams') or {}) for k in PLAN_FIELDS):
+  if isinstance(d,dict):
+   if d.get('plan') and (any(k not in (d.get('planParams') or {}) for k in PLAN_FIELDS) or not d.get('planFingerprints')):
     d.update(plan=[],planParams=None)
+   elif d.get('planParams'):
+    d['planParams']={k:d['planParams'].get(k) for k in PLAN_FIELDS}
    legacy='sourceOrderMode' not in d
    if d.get('sourceOrderMode')!='manual':
     old=[f['path'] for f in d.get('files',[])]
@@ -139,6 +267,13 @@ def restore():
    STATE.update(d)
    persist()
  except Exception:pass
+ history=load_history()
+ record=history.get('export') or {}
+ changed=False
+ for run in record.get('runs',{}).values():
+  if run.get('status')=='running':
+   run['status']='interrupted';changed=True
+ if changed:atomic_json(history_path(),history)
 
 def analyse(f):
  path=f['path']; duration=f['duration']; step=.25; energies=[]
@@ -267,6 +402,17 @@ def plan(settings, progress):
   files=list(STATE['files']);confirmed=STATE.get('orderConfirmed',False);poster=STATE.get('poster')
  if not files: raise ValueError('请先导入剧集。')
  if not confirmed:raise ValueError('请先在导入页确认原集顺序。')
+ reusable=False
+ if STATE.get('plan') and STATE.get('planParams')==plan_key(settings):
+  try:require_current_plan(settings);reusable=True
+  except ValueError:pass
+ if reusable:
+  with LOCK:
+   STATE['settings']=settings
+   rows=copy.deepcopy(STATE['plan'])
+  persist();save_analysis_history()
+  progress('已复用最近拆点记录（包含人工切点）',100)
+  return {'plan':rows,'count':len(rows),'target':int(settings.get('target',len(files))),'warnings':STATE['warnings'],'reused':True}
  minlen=max(10,float(settings.get('minSeconds',45)));maxlen=max(minlen,float(settings.get('maxSeconds',60)))
  target=max(1,int(settings.get('target',len(files))))
  def analyze_source(f):
@@ -293,8 +439,11 @@ def plan(settings, progress):
   for j in range(len(points)-1):
    duration=points[j+1]-points[j]
    rows.append({'id':len(rows)+1,'episode':startnum+len(rows),'source':i,'sourceOrdinal':i+1,'sourceNumber':f.get('sourceNumber'),'segment':j+1,'segmentsInSource':len(points)-1,'file':f['name'],'start':round(points[j],2),'end':round(points[j+1],2),'duration':round(duration,2),'cutReason':cuts[j]['reason'] if j<len(cuts) else '原集结尾','confidence':cuts[j]['confidence'] if j<len(cuts) else 90,'review':duration<minlen or duration>maxlen or (j<len(cuts) and cuts[j]['confidence']<40)})
- with LOCK: STATE.update(plan=rows,planParams=plan_key(settings),settings=settings,analyses=[{'candidates':c,'cleanStart':a,'cleanEnd':e} for c,a,e in analyses],samples={},sampleCovers={},sampleSignature=None)
+ fingerprints=plan_fingerprints(files)
+ poster_fingerprint=file_fingerprint(poster) if poster and settings.get('autoRemoveIntroCover',True) else None
+ with LOCK: STATE.update(plan=rows,planParams=plan_key(settings),planFingerprints=fingerprints,posterFingerprint=poster_fingerprint,settings=settings,analyses=[{'candidates':c,'cleanStart':a,'cleanEnd':e} for c,a,e in analyses],samples={},sampleCovers={},sampleSignature=None)
  persist()
+ save_analysis_history()
  progress('分析完成',100)
  return {'plan':rows,'count':len(rows),'target':target,'warnings':STATE['warnings']}
 
@@ -397,6 +546,15 @@ def render_assets(settings):
 def render_signature(settings,rows=None,assets=None):
  rows=rows if rows is not None else STATE['plan']
  if assets is None:assets=render_assets(settings)
+ ignored={'exportSrt','srtFolder','target','startEpisode','minSeconds','maxSeconds',
+          'removeOld','trimIntroSeconds','trimIntroFrames','autoRemoveIntroCover'}
+ if not settings.get('removeText'):
+  ignored.update({'language','subtitleTopPct','subtitleBottomPct','nameTopPct',
+                  'nameBottomPct','removeNameBars'})
+ relevant={k:v for k,v in settings.items() if k not in ignored}
+ return hashlib.sha256(json.dumps(['video-v2',rows,relevant,assets],sort_keys=True,ensure_ascii=False).encode()).hexdigest()
+
+def legacy_render_signature(settings,rows,assets):
  return hashlib.sha256(json.dumps([rows,settings,assets],sort_keys=True,ensure_ascii=False).encode()).hexdigest()
 
 @lru_cache(maxsize=1)
@@ -627,6 +785,7 @@ def export_srt_only(rows,settings,folder,progress):
  for i,row in enumerate(rows):
   progress(f'仅导出 SRT {i+1}/{len(rows)} · EP{row["episode"]}',i/len(rows)*100)
   written+=write_srt(row,settings,folder)
+  record_export_file('srt',int(row['episode']),folder/f'{row["episode"]}.srt')
   progress(f'已完成字幕 {i+1}/{len(rows)} · EP{row["episode"]}',(i+1)/len(rows)*100)
  return {'folder':str(folder),'files':len(rows),'written':written}
 
@@ -652,11 +811,13 @@ def export_episodes(rows,settings,out,progress):
   progress(f'视频 {i+1}/{len(rows)} · EP{ep}{estimate}',i/len(rows)*100)
   signature=render_signature(settings,[row],assets)
   valid_signatures={signature}
+  valid_signatures.add(legacy_render_signature(settings,[row],assets))
   # Keep resumable beta.2 renders when the user explicitly selects the
   # unchanged software quality mode; fast mode produces a different encode.
   if settings.get('encodingMode')=='quality':
    old_settings=dict(settings);old_settings.pop('encodingMode',None)
    valid_signatures.add(render_signature(old_settings,[row],assets))
+   valid_signatures.add(legacy_render_signature(old_settings,[row],assets))
   reused=False
   if export_stamp_matches_file(stamp,dest):
    try:
@@ -666,9 +827,11 @@ def export_episodes(rows,settings,out,progress):
   if not reused:
    done.append(export_one(row,settings,dest))
    record_export_stamp(stamp,dest,signature)
+  record_export_file('clean' if settings.get('removeText') else 'normal',ep,dest)
   if srt_folder:
    progress(f'字幕 {i+1}/{len(rows)} · EP{ep}',(i+.7)/len(rows)*100)
    write_srt(row,settings,srt_folder,valid_signatures)
+   record_export_file('srt',ep,srt_folder/f'{ep}.srt')
   progress(f'已完成 {i+1}/{len(rows)} · EP{ep}',(i+1)/len(rows)*100)
  return {'folder':str(out),'files':len(done),'srtFolder':str(srt_folder) if srt_folder else None}
 
@@ -700,6 +863,7 @@ class Handler(BaseHTTPRequestHandler):
    self.auth(); path=urllib.parse.urlparse(self.path).path
    if path=='/state':
     with LOCK:self.respond({k:v for k,v in STATE.items() if k!='analyses'})
+   elif path=='/history':self.respond(visible_history())
    elif path=='/job':self.respond(STATE['job'] or {})
    elif path=='/poster':
     p=STATE.get('poster')
@@ -743,9 +907,32 @@ class Handler(BaseHTTPRequestHandler):
     result=filedialog.askdirectory() if kind=='folder' else filedialog.askopenfilename(filetypes=[('海报','*.png *.jpg *.jpeg *.webp')]);root.destroy()
     self.respond({'path':result})
    elif path=='/scan':self.respond(scan(data.get('folder',''),data.get('poster','')))
+   elif path=='/history/restore':
+    kind=data.get('kind','analysis')
+    if kind not in {'analysis','export'}:raise ValueError('历史记录类型无效。')
+    with LOCK:
+     if STATE.get('job') and STATE['job']['status']=='running':raise ValueError('任务运行中，暂不能切换记录。')
+     history=load_history();snapshot=history.get('analysis') if kind=='analysis' else (history.get('export') or {}).get('analysis')
+     if not snapshot:raise ValueError('这条历史记录不存在。')
+     if not snapshot_valid(snapshot):raise ValueError('原片或海报缺失、发生变化；请重新挂载 NAS 或重新导入分析。历史记录没有删除。')
+     runs=(history.get('export') or {}).get('runs',{}) if kind=='export' else {}
+     recent=max(runs.values(),key=lambda r:r.get('updatedAt',0)) if runs else {}
+     video_runs=[r for name,r in runs.items() if name in {'normal','clean'}]
+     output_run=max(video_runs,key=lambda r:r.get('updatedAt',0)) if video_runs else {}
+     STATE.update(files=copy.deepcopy(snapshot['files']),poster=snapshot.get('poster'),plan=copy.deepcopy(snapshot['plan']),planParams=snapshot['planParams'],planFingerprints=snapshot['fingerprints'],posterFingerprint=snapshot.get('posterFingerprint'),settings=copy.deepcopy(recent.get('settings') or snapshot['settings']),sourceOrderMode=snapshot.get('sourceOrderMode','auto'),orderConfirmed=True,samples={},sampleCovers={},sampleSignature=None)
+     persist()
+     self.respond({**{k:v for k,v in STATE.items() if k!='analyses'},'outputFolder':output_run.get('folder',''),'srtFolder':runs.get('srt',{}).get('folder','')})
+   elif path=='/history/delete':
+    kind=data.get('kind')
+    if kind not in {'analysis','export'}:raise ValueError('历史记录类型无效。')
+    with LOCK:
+     if STATE.get('job') and STATE['job']['status']=='running':raise ValueError('任务运行中，暂不能删除记录。')
+     history=load_history();history.pop(kind,None);atomic_json(history_path(),history)
+    self.respond(visible_history())
    elif path=='/source-order':
     paths=data.get('paths',[]);trims=data.get('tailTrims',{});head_trims=data.get('headTrims',{});mode=data.get('mode','manual')
     with LOCK:
+     if STATE.get('job') and STATE['job']['status']=='running':raise ValueError('任务运行中，暂不能调整素材。')
      existing={f['path']:f for f in STATE['files']}
      if not isinstance(paths,list) or not paths or len(paths)!=len(set(paths)) or any(p not in existing for p in paths):raise ValueError('原集顺序无效，请重新导入。')
      ordered=[]
@@ -757,12 +944,19 @@ class Handler(BaseHTTPRequestHandler):
       ordered.append(f)
      if mode=='auto':ordered.sort(key=lambda f:sortkey(Path(f['name'])))
      for i,f in enumerate(ordered):f['sourceOrdinal']=i+1
-     STATE.update(files=ordered,plan=[],planParams=None,samples={},sampleCovers={},sampleSignature=None,orderConfirmed=True,sourceOrderMode='auto' if mode=='auto' else 'manual')
+     unchanged=ordered==STATE['files'] and bool(STATE.get('plan'))
+     if unchanged:
+      try:require_current_plan(STATE['settings'])
+      except ValueError:unchanged=False
+     changes={} if unchanged else dict(plan=[],planParams=None,planFingerprints=None,posterFingerprint=None,samples={},sampleCovers={},sampleSignature=None)
+     STATE.update(files=ordered,orderConfirmed=True,sourceOrderMode='auto' if mode=='auto' else 'manual',**changes)
     persist()
-    self.respond({'files':ordered,'duration':sum(f['duration'] for f in ordered),'size':sum(f['size'] for f in ordered)})
+    self.respond({'files':ordered,'duration':sum(f['duration'] for f in ordered),'size':sum(f['size'] for f in ordered),'reused':unchanged,'plan':STATE['plan'] if unchanged else []})
    elif path=='/set-poster':
     poster_path=checked_poster(data.get('poster',''))
-    with LOCK:STATE['poster']=poster_path;STATE['samples']={};STATE['sampleCovers']={};STATE['sampleSignature']=None
+    with LOCK:
+     if STATE.get('job') and STATE['job']['status']=='running':raise ValueError('任务运行中，暂不能更换海报。')
+     STATE['poster']=poster_path;STATE['samples']={};STATE['sampleCovers']={};STATE['sampleSignature']=None
     persist()
     self.respond({'poster':poster_path})
    elif path=='/validate-effect-audio':
@@ -781,10 +975,11 @@ class Handler(BaseHTTPRequestHandler):
      if adjacent:b['start']=t;b['duration']=round(b['end']-t,2)
      STATE['samples']={};STATE['sampleCovers']={};STATE['sampleSignature']=None
     persist()
+    save_analysis_history()
     self.respond({'plan':rows})
    elif path=='/sample':
     with LOCK:STATE['settings'].update(data.get('settings',{}))
-    if STATE.get('planParams')!=plan_key(STATE['settings']):raise ValueError('分集设定已更改，请重新分析剧情并生成切点。')
+    require_current_plan(STATE['settings'])
     persist()
     ep=int(data['episode']);row=next((r for r in STATE['plan'] if r['episode']==ep),None)
     if not row:raise ValueError('找不到该集')
@@ -805,7 +1000,7 @@ class Handler(BaseHTTPRequestHandler):
     self.respond(start_job('sample',task))
    elif path=='/tail-preview':
     with LOCK:STATE['settings'].update(data.get('settings',{}))
-    if STATE.get('planParams')!=plan_key(STATE['settings']):raise ValueError('分集设定已更改，请重新生成切点。')
+    require_current_plan(STATE['settings'])
     persist()
     ep=int(data['episode']);row=next((r for r in STATE['plan'] if r['episode']==ep),None)
     if not row:raise ValueError('找不到该集')
@@ -820,16 +1015,24 @@ class Handler(BaseHTTPRequestHandler):
     self.respond(start_job('tail',task))
    elif path=='/export':
     with LOCK:STATE['settings'].update(data.get('settings',{}))
-    if STATE.get('planParams')!=plan_key(STATE['settings']):raise ValueError('分集设定已更改，请重新分析剧情并生成切点。')
+    require_current_plan(STATE['settings'])
     persist()
     out=safe_out(data['folder']);rows=list(STATE['plan']);settings=dict(STATE['settings'])
     if not rows:raise ValueError('请先生成拆集方案')
     if STATE.get('sampleSignature')!=render_signature(settings,rows):raise ValueError('封面、切点、源文件或片尾设置已变化，请重新生成样片。')
     if shutil.disk_usage(out).free < sum(f['size'] for f in STATE['files'])*.8:raise ValueError('输出磁盘空间不足，请更换目录或清理空间。')
-    self.respond(start_job('export',lambda progress:export_episodes(rows,settings,out,progress)))
+    mode='clean' if settings.get('removeText') else 'normal'
+    other='normal' if mode=='clean' else 'clean'
+    old_run=(load_history().get('export') or {}).get('runs',{}).get(other)
+    if old_run and Path(old_run['folder'])==out:
+     raise ValueError('普通成片和纯净版不能使用同一个数字命名输出目录，请为另一版本选择独立目录。')
+    modes=[(mode,out)]
+    if settings.get('exportSrt') and settings.get('srtFolder'):
+     modes.append(('srt',Path(settings['srtFolder']).expanduser().resolve()))
+    self.respond(start_job('export',lambda progress:tracked_export(modes,rows,settings,lambda:export_episodes(rows,settings,out,progress))))
    elif path=='/export-srt':
     with LOCK:STATE['settings'].update(data.get('settings',{}))
-    if STATE.get('planParams')!=plan_key(STATE['settings']):raise ValueError('分集设定已更改，请重新分析剧情并生成切点。')
+    require_current_plan(STATE['settings'])
     rows=list(STATE['plan']);settings=dict(STATE['settings'])
     if not rows:raise ValueError('请先生成拆集方案')
     if not data.get('folder'):raise ValueError('请单独选择 SRT 导出目录。')
@@ -837,7 +1040,7 @@ class Handler(BaseHTTPRequestHandler):
     if data.get('videoFolder') and folder==Path(data['videoFolder']).expanduser().resolve():
      raise ValueError('SRT 目录必须与 MP4 目录分开。')
     persist()
-    self.respond(start_job('export-srt',lambda progress:export_srt_only(rows,settings,folder,progress)))
+    self.respond(start_job('export-srt',lambda progress:tracked_export([('srt',folder)],rows,settings,lambda:export_srt_only(rows,settings,folder,progress))))
    else:self.respond({'error':'未知路径'},404)
   except Exception as e:self.respond({'error':str(e)},403 if isinstance(e,PermissionError) else 400)
 

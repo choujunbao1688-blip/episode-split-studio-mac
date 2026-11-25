@@ -1,5 +1,5 @@
 'use strict';
-const {app,BrowserWindow,dialog,ipcMain}=require('electron');
+const {app,BrowserWindow,dialog,ipcMain,shell}=require('electron');
 const path=require('path');
 const fs=require('fs');
 const net=require('net');
@@ -55,6 +55,21 @@ ipcMain.handle('choose-path',async (_event,kind)=>{
  if(!window)return '';
  const choice=kind==='poster'?await dialog.showOpenDialog(window,{title:'选择纯净海报',properties:['openFile'],filters:[{name:'图片',extensions:['png','jpg','jpeg','webp']}]}):kind==='effect-audio'?await dialog.showOpenDialog(window,{title:'选择片尾音效',properties:['openFile'],filters:[{name:'音频',extensions:['mp3','wav','m4a','aac','flac']}]}):kind==='effect-visual'?await dialog.showOpenDialog(window,{title:'选择画面效果素材',properties:['openFile'],filters:[{name:'视频或图片',extensions:['png','webp','mp4','m4v','mov','webm']}]}):await dialog.showOpenDialog(window,{title:kind==='output'?'选择成片导出目录':kind==='srt-output'?'选择 SRT 导出目录':'选择剧集目录',properties:['openDirectory']});
  return choice.canceled?'':choice.filePaths[0];
+});
+ipcMain.handle('open-history',async (_event,kind,mode,episode)=>{
+ if(!serverConfig||!['folder','file'].includes(kind)||!['normal','clean','srt'].includes(mode))throw new Error('历史文件无效。');
+ const {token,port}=serverConfig;
+ const response=await fetch(`http://127.0.0.1:${port}/history`,{headers:{'X-Studio-Token':token}});
+ if(!response.ok)throw new Error('无法读取历史记录。');
+ const history=await response.json(),run=history.export?.runs?.[mode];
+ if(!run)throw new Error('历史记录已不存在。');
+ const target=kind==='folder'?run.folder:run.files.find(item=>item.episode===episode)?.path;
+ if(!target||!fs.existsSync(target))throw new Error('原输出文件或目录暂不可用，请检查 NAS。');
+ const stat=fs.statSync(target);
+ if(kind==='folder'?!stat.isDirectory():!stat.isFile())throw new Error('历史路径类型不符。');
+ const error=await shell.openPath(target);
+ if(error)throw new Error(error);
+ return true;
 });
 app.on('before-quit',()=>{app.isQuitting=true;if(server)server.kill('SIGTERM')});
 app.whenReady().then(launch).catch(e=>startupError(e.message));

@@ -797,10 +797,14 @@ def export_stamp_matches_file(stamp,dest):
   return info.get('size')==stat.st_size and info.get('mtimeNs')==stat.st_mtime_ns
  except (OSError,ValueError,TypeError):return False
 
-def record_export_stamp(stamp,dest,signature):
+def row_digest(row):
+ return hashlib.sha256(json.dumps(row,sort_keys=True,ensure_ascii=False).encode()).hexdigest()
+
+def record_export_stamp(stamp,dest,signature,row=None):
  stamp.parent.mkdir(parents=True,exist_ok=True)
  stat=dest.stat()
  data={'signature':signature,'size':stat.st_size,'mtimeNs':stat.st_mtime_ns}
+ if row is not None:data['rowDigest']=row_digest(row)
  fd,name=tempfile.mkstemp(prefix='export-',suffix='.tmp',dir=stamp.parent)
  try:
   with os.fdopen(fd,'w',encoding='utf-8') as stream:
@@ -870,21 +874,34 @@ def compatible_video_signatures(row,settings,assets):
   valid.update({render_signature(prior,[row],assets),legacy_render_signature(prior,[row],assets)})
  return valid
 
-def export_episodes(rows,settings,out,progress):
+def preflight_video_outputs(rows,settings,out,assets):
  episodes=checked_episodes(rows)
- assets=render_assets(settings)
- # Check every destination before touching any file. Re-numbering after a
- # manual split must never silently overwrite the previous delivery.
+ history_export=load_history().get('export') or {}
+ old_plan=(history_export.get('analysis') or {}).get('plan') or []
+ old_rows={r['episode']:r for r in old_plan}
+ old_folders={Path(run.get('folder','')).expanduser().resolve()
+              for mode,run in history_export.get('runs',{}).items()
+              if mode in ('normal','clean') and run.get('folder')}
  for ep,row in zip(episodes,rows):
   dest=out/f'{ep}.mp4'
   if dest.exists():
    stamp=export_stamp_path(out,ep)
    if not export_stamp_matches_file(stamp,dest):
     raise ValueError(f'{dest.name} 已存在且不是本任务已记录的导出文件；请更换输出目录或先移走该文件。')
-   try:signature=json.loads(stamp.read_text(encoding='utf-8')).get('signature')
-   except (OSError,ValueError,TypeError):signature=None
-   if signature not in compatible_video_signatures(row,settings,assets):
-    raise ValueError(f'{dest.name} 属于旧切点或不同的成片设置。为避免覆盖已有成片，已阻止导出；请另选空目录，原视频与旧成片均未修改。')
+   try:info=json.loads(stamp.read_text(encoding='utf-8'))
+   except (OSError,ValueError,TypeError):info={}
+   if info.get('signature') in compatible_video_signatures(row,settings,assets):continue
+   old_digest=info.get('rowDigest')
+   mapping_changed=(old_digest!=row_digest(row) if old_digest else
+                    out.resolve() in old_folders and old_rows.get(ep)!=row)
+   if mapping_changed:
+    raise ValueError(f'{dest.name} 属于旧切点或旧集号，内容已变化。为避免覆盖已有成片，已阻止导出；请另选空目录，原视频与旧成片均未修改。')
+
+def export_episodes(rows,settings,out,progress):
+ episodes=checked_episodes(rows)
+ assets=render_assets(settings)
+ # Check every destination before touching any file.
+ preflight_video_outputs(rows,settings,out,assets)
  srt_folder=None
  if settings.get('exportSrt',False):
   if not settings.get('srtFolder'):
@@ -908,7 +925,7 @@ def export_episodes(rows,settings,out,progress):
    except (OSError,ValueError,KeyError):pass
   if not reused:
    done.append(export_one(row,settings,dest))
-   record_export_stamp(stamp,dest,signature)
+   record_export_stamp(stamp,dest,signature,row)
   record_export_file('clean' if settings.get('removeText') else 'normal',ep,dest)
   if srt_folder:
    progress(f'字幕 {i+1}/{len(rows)} · EP{ep}',(i+.7)/len(rows)*100)
@@ -1145,6 +1162,7 @@ class Handler(BaseHTTPRequestHandler):
     old_run=(load_history().get('export') or {}).get('runs',{}).get(other)
     if old_run and Path(old_run['folder'])==out:
      raise ValueError('普通成片和纯净版不能使用同一个数字命名输出目录，请为另一版本选择独立目录。')
+    preflight_video_outputs(rows,settings,out,render_assets(settings))
     modes=[(mode,out)]
     if settings.get('exportSrt') and settings.get('srtFolder'):
      modes.append(('srt',Path(settings['srtFolder']).expanduser().resolve()))

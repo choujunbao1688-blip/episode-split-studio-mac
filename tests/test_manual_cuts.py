@@ -123,10 +123,26 @@ class ManualCutTests(unittest.TestCase):
         video.write_bytes(b'old complete 125 seconds')
         settings = dict(self.settings, coverEnabled=False, tailEnabled=False)
         old_signature = agent.render_signature(settings, [agent.STATE['plan'][0]])
-        agent.record_export_stamp(agent.export_stamp_path(folder, 17), video, old_signature)
+        agent.record_export_stamp(agent.export_stamp_path(folder, 17), video,
+                                  old_signature, agent.STATE['plan'][0])
         self.post('/update-cut', {'index': 0, 'time': 62})
-        with self.assertRaisesRegex(ValueError, '旧切点或不同的成片设置'):
+        with self.assertRaisesRegex(ValueError, '旧切点或旧集号'):
             agent.export_episodes(agent.STATE['plan'], settings, folder, lambda *_: None)
+        self.assertEqual(video.read_bytes(), b'old complete 125 seconds')
+
+    def test_beta5_stamp_uses_export_history_to_detect_changed_cut(self):
+        folder = self.root / 'delivery'
+        folder.mkdir()
+        video = folder / '17.mp4'
+        video.write_bytes(b'old complete 125 seconds')
+        settings = dict(self.settings, coverEnabled=False, tailEnabled=False)
+        old_signature = agent.render_signature(settings, [agent.STATE['plan'][0]])
+        agent.record_export_stamp(agent.export_stamp_path(folder, 17), video, old_signature)
+        agent.begin_export_history('normal', folder, agent.STATE['plan'], settings)
+        self.post('/update-cut', {'index': 0, 'time': 62})
+        with self.assertRaisesRegex(ValueError, '旧切点或旧集号'):
+            agent.preflight_video_outputs(agent.STATE['plan'], settings, folder,
+                                          agent.render_assets(settings))
         self.assertEqual(video.read_bytes(), b'old complete 125 seconds')
 
 

@@ -50,7 +50,9 @@ class HistoryTests(unittest.TestCase):
         self.assertEqual([r['episode'] for r in result['plan']], [20, 21, 22, 23])
         rows = agent.STATE['plan']
         rows[0]['end'] = 26
+        rows[0]['duration'] = 26
         rows[1]['start'] = 26
+        rows[1]['duration'] = 24
         rows[0]['cutReason'] = '人工调整'
         agent.persist()
         agent.save_analysis_history()

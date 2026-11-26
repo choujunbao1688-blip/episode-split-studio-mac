@@ -118,11 +118,11 @@ def scan(folder,poster):
   files=previous['files']
   with LOCK:
    if STATE.get('job') and STATE['job']['status']=='running':raise ValueError('任务运行中，暂不能重新导入素材。')
-   STATE.update(files=files,poster=poster_path,plan=previous['plan'],planParams=previous['planParams'],planFingerprints=previous['fingerprints'],posterFingerprint=previous.get('posterFingerprint'),settings=previous['settings'],warnings=warnings,orderConfirmed=True,sourceOrderMode=previous.get('sourceOrderMode','auto'),samples={},sampleCovers={},sampleSignature=None)
+   STATE.update(files=files,poster=poster_path,plan=previous['plan'],planParams=previous['planParams'],planFingerprints=previous['fingerprints'],posterFingerprint=previous.get('posterFingerprint'),sourceBounds=previous.get('sourceBounds'),settings=previous['settings'],warnings=warnings,orderConfirmed=True,sourceOrderMode=previous.get('sourceOrderMode','auto'),samples={},sampleCovers={},sampleSignature=None)
  else:
   with LOCK:
    if STATE.get('job') and STATE['job']['status']=='running':raise ValueError('任务运行中，暂不能重新导入素材。')
-   STATE.update(files=files,poster=poster_path,plan=[],planParams=None,planFingerprints=None,posterFingerprint=None,warnings=warnings,orderConfirmed=True,sourceOrderMode='auto',samples={},sampleCovers={},sampleSignature=None)
+   STATE.update(files=files,poster=poster_path,plan=[],planParams=None,planFingerprints=None,posterFingerprint=None,sourceBounds=None,warnings=warnings,orderConfirmed=True,sourceOrderMode='auto',samples={},sampleCovers={},sampleSignature=None)
  persist()
  return {'files':files,'warnings':warnings,'duration':sum(f['duration'] for f in files),'size':sum(f['size'] for f in files),'reused':reused,'plan':STATE['plan'] if reused else [],'settings':STATE['settings'] if reused else {}}
 
@@ -161,7 +161,7 @@ def load_history():
 
 def analysis_snapshot():
  with LOCK:
-  return {k:copy.deepcopy(STATE.get(k)) for k in ('files','poster','plan','planParams','planFingerprints','posterFingerprint','settings','sourceOrderMode')}
+  return {k:copy.deepcopy(STATE.get(k)) for k in ('files','poster','plan','planParams','planFingerprints','posterFingerprint','sourceBounds','settings','sourceOrderMode')}
 
 def save_analysis_history():
  with LOCK:
@@ -180,6 +180,88 @@ def require_current_plan(settings):
             'poster':STATE.get('poster'),'posterFingerprint':STATE.get('posterFingerprint'),
             'planParams':STATE['planParams']}
   if not snapshot_valid(snapshot):raise ValueError('源片或海报已变化、或 NAS 未挂载；请核查素材后重新分析。最近记录仍保留。')
+  validate_plan_coverage(STATE['plan'],STATE['files'],current_source_bounds(),STATE['planParams'])
+
+def clean_source_interval(f,settings,poster):
+ candidates,intro,end=cached_analyse(f)
+ if not settings.get('removeOld',True):intro=0;end=f['duration']
+ fps=float(f.get('fps') or probe(f['path'])['fps'])
+ cover_frames=cached_intro_cover_frames(f,poster) if settings.get('autoRemoveIntroCover',True) else 0
+ frame_skip=max(0,int(settings.get('trimIntroFrames',0)),int(f.get('headTrimFrames',0)))
+ intro=max(intro,cover_frames/fps,frame_skip/fps,float(settings.get('trimIntroSeconds',0)))
+ if float(f.get('tailTrim',0))>0:end=min(end,f['duration']-float(f['tailTrim']))
+ if end-intro<4:end=f['duration'];intro=0
+ return candidates,intro,end
+
+def current_source_bounds():
+ with LOCK:
+  bounds=STATE.get('sourceBounds')
+  files=list(STATE['files']);settings=dict(STATE.get('settings') or {});poster=STATE.get('poster')
+ if bounds and len(bounds)==len(files):return bounds
+ # beta.5 plans did not save the clean intervals. Their per-source analyses
+ # are cached, so this reconstructs the expected coverage without replanning.
+ return [{'start':round(start,2),'end':round(end,2)}
+         for f in files for _,start,end in [clean_source_interval(f,settings,poster)]]
+
+def validate_plan_coverage(rows,files,bounds,params):
+ if len(bounds)!=len(files) or not rows:raise ValueError('分集方案不完整；请重新生成切点。')
+ first=max(1,int((params or {}).get('startEpisode',rows[0]['episode'])))
+ if [r['source'] for r in rows]!=sorted(r['source'] for r in rows):
+  raise ValueError('原集顺序发生混乱，已阻止保存和导出；请重新生成切点。')
+ for index,(f,limit) in enumerate(zip(files,bounds)):
+  group=[r for r in rows if r['source']==index]
+  label=f'原集{f.get("sourceOrdinal",index+1)}（{f["name"]}）'
+  if not group:raise ValueError(f'{label}未分配到任何新集；已阻止保存和导出。请重新生成切点。')
+  if abs(group[0]['start']-limit['start'])>.04:
+   raise ValueError(f'{label}开头 {limit["start"]:.2f}～{group[0]["start"]:.2f} 秒未分配；已阻止保存和导出。')
+  for left,right in zip(group,group[1:]):
+   if abs(left['end']-right['start'])>.04:
+    raise ValueError(f'{label}的 {left["end"]:.2f}～{right["start"]:.2f} 秒存在缺口或重叠；已阻止保存和导出。')
+  if abs(group[-1]['end']-limit['end'])>.04:
+   raise ValueError(f'{label}的 {group[-1]["end"]:.2f}～{limit["end"]:.2f} 秒未正确分配；已阻止保存和导出。请点击“补齐未分配片段”。')
+  for segment,row in enumerate(group,1):
+   if row['end']-row['start']<.01 or abs(row['duration']-(row['end']-row['start']))>.04:
+    raise ValueError(f'{label}的第{segment}段时长无效；已阻止保存和导出。')
+   if row['segment']!=segment or row['segmentsInSource']!=len(group):
+    raise ValueError(f'{label}的片段顺序不一致；已阻止保存和导出。')
+ for index,row in enumerate(rows):
+  if row['episode']!=first+index or row['id']!=index+1:
+   raise ValueError('新集编号不连续，已阻止保存和导出；请重新生成切点。')
+
+def renumber_plan(rows,files,params):
+ first=max(1,int((params or {}).get('startEpisode',rows[0]['episode'])))
+ for index,row in enumerate(rows):
+  f=files[row['source']]
+  group=[r for r in rows if r['source']==row['source']]
+  row.update(id=index+1,episode=first+index,sourceOrdinal=row['source']+1,
+             sourceNumber=f.get('sourceNumber'),file=f['name'],
+             segment=group.index(row)+1,segmentsInSource=len(group),
+             duration=round(row['end']-row['start'],2))
+
+def repair_missing_tails(rows,files,bounds,params):
+ result=copy.deepcopy(rows);fixed=[]
+ for index,(f,limit) in enumerate(zip(files,bounds)):
+  group=[r for r in result if r['source']==index]
+  if not group:raise ValueError(f'原集{index+1}完全缺失；请重新生成切点。')
+  if abs(group[0]['start']-limit['start'])>.04 or any(abs(a['end']-b['start'])>.04 for a,b in zip(group,group[1:])):
+   raise ValueError(f'原集{index+1}存在中间缺口或重叠；请重新生成切点。')
+  last=group[-1];gap=round(limit['end']-last['end'],2)
+  if gap<-.04:raise ValueError(f'原集{index+1}切点越过原片结尾；请重新生成切点。')
+  if gap>.04:
+   if gap<3:
+    last['end']=limit['end'];fixed.append(f'原集{index+1}末尾 {gap:.2f} 秒已并回上一集')
+   else:
+    tail=copy.deepcopy(last)
+    tail.update(start=last['end'],end=limit['end'],cutReason='原集结尾',confidence=90)
+    result.insert(result.index(last)+1,tail)
+    fixed.append(f'原集{index+1}的 {tail["start"]:.2f}～{tail["end"]:.2f} 秒已补成新集')
+ renumber_plan(result,files,params)
+ minimum=float((params or {}).get('minSeconds') or 45)
+ maximum=float((params or {}).get('maxSeconds') or 60)
+ for row in result:
+  row['review']=row['duration']<minimum or row['duration']>maximum
+ validate_plan_coverage(result,files,bounds,params)
+ return result,fixed
 
 def visible_history():
  with LOCK:history=load_history()
@@ -237,7 +319,7 @@ def tracked_export(modes,rows,settings,task):
 
 def persist():
  with LOCK:
-  data={k:STATE.get(k) for k in ('files','poster','plan','planParams','planFingerprints','posterFingerprint','settings','warnings','orderConfirmed','sourceOrderMode')}
+  data={k:STATE.get(k) for k in ('files','poster','plan','planParams','planFingerprints','posterFingerprint','sourceBounds','settings','warnings','orderConfirmed','sourceOrderMode')}
   CACHE.mkdir(parents=True,exist_ok=True)
   fd,name=tempfile.mkstemp(prefix='state-',suffix='.tmp',dir=CACHE)
   try:
@@ -415,19 +497,9 @@ def plan(settings, progress):
   return {'plan':rows,'count':len(rows),'target':int(settings.get('target',len(files))),'warnings':STATE['warnings'],'reused':True}
  minlen=max(10,float(settings.get('minSeconds',45)));maxlen=max(minlen,float(settings.get('maxSeconds',60)))
  target=max(1,int(settings.get('target',len(files))))
- def analyze_source(f):
-  candidates,intro,end=cached_analyse(f)
-  if not settings.get('removeOld',True):intro=0;end=f['duration']
-  fps=float(f.get('fps') or probe(f['path'])['fps'])
-  cover_frames=cached_intro_cover_frames(f,poster) if settings.get('autoRemoveIntroCover',True) else 0
-  frame_skip=max(0,int(settings.get('trimIntroFrames',0)),int(f.get('headTrimFrames',0)))
-  intro=max(intro,cover_frames/fps,frame_skip/fps,float(settings.get('trimIntroSeconds',0)))
-  if float(f.get('tailTrim',0))>0:end=min(end,f['duration']-float(f['tailTrim']))
-  if end-intro<4:end=f['duration'];intro=0
-  return candidates,intro,end
  analyses=[None]*len(files)
  with ThreadPoolExecutor(max_workers=min(2,len(files))) as pool:
-  futures={pool.submit(analyze_source,f):i for i,f in enumerate(files)}
+  futures={pool.submit(clean_source_interval,f,settings,poster):i for i,f in enumerate(files)}
   for completed,future in enumerate(as_completed(futures),1):
    i=futures[future];analyses[i]=future.result()
    progress(f'已分析 {completed}/{len(files)} · {files[i]["name"]}',completed/len(files)*75)
@@ -441,7 +513,9 @@ def plan(settings, progress):
    rows.append({'id':len(rows)+1,'episode':startnum+len(rows),'source':i,'sourceOrdinal':i+1,'sourceNumber':f.get('sourceNumber'),'segment':j+1,'segmentsInSource':len(points)-1,'file':f['name'],'start':round(points[j],2),'end':round(points[j+1],2),'duration':round(duration,2),'cutReason':cuts[j]['reason'] if j<len(cuts) else '原集结尾','confidence':cuts[j]['confidence'] if j<len(cuts) else 90,'review':duration<minlen or duration>maxlen or (j<len(cuts) and cuts[j]['confidence']<40)})
  fingerprints=plan_fingerprints(files)
  poster_fingerprint=file_fingerprint(poster) if poster and settings.get('autoRemoveIntroCover',True) else None
- with LOCK: STATE.update(plan=rows,planParams=plan_key(settings),planFingerprints=fingerprints,posterFingerprint=poster_fingerprint,settings=settings,analyses=[{'candidates':c,'cleanStart':a,'cleanEnd':e} for c,a,e in analyses],samples={},sampleCovers={},sampleSignature=None)
+ bounds=[{'start':round(a,2),'end':round(e,2)} for _,a,e in analyses]
+ validate_plan_coverage(rows,files,bounds,plan_key(settings))
+ with LOCK: STATE.update(plan=rows,planParams=plan_key(settings),planFingerprints=fingerprints,posterFingerprint=poster_fingerprint,sourceBounds=bounds,settings=settings,analyses=[{'candidates':c,'cleanStart':a,'cleanEnd':e} for c,a,e in analyses],samples={},sampleCovers={},sampleSignature=None)
  persist()
  save_analysis_history()
  progress('分析完成',100)
@@ -789,13 +863,28 @@ def export_srt_only(rows,settings,folder,progress):
   progress(f'已完成字幕 {i+1}/{len(rows)} · EP{row["episode"]}',(i+1)/len(rows)*100)
  return {'folder':str(folder),'files':len(rows),'written':written}
 
+def compatible_video_signatures(row,settings,assets):
+ valid={render_signature(settings,[row],assets),legacy_render_signature(settings,[row],assets)}
+ if settings.get('encodingMode')=='quality':
+  prior=dict(settings);prior.pop('encodingMode',None)
+  valid.update({render_signature(prior,[row],assets),legacy_render_signature(prior,[row],assets)})
+ return valid
+
 def export_episodes(rows,settings,out,progress):
  episodes=checked_episodes(rows)
- # Pure numeric names could collide with unrelated source footage in this folder.
- for ep in episodes:
+ assets=render_assets(settings)
+ # Check every destination before touching any file. Re-numbering after a
+ # manual split must never silently overwrite the previous delivery.
+ for ep,row in zip(episodes,rows):
   dest=out/f'{ep}.mp4'
-  if dest.exists() and not export_stamp_matches_file(export_stamp_path(out,ep),dest):
-   raise ValueError(f'{dest.name} 已存在且不是本任务已记录的导出文件；请更换输出目录或先移走该文件。')
+  if dest.exists():
+   stamp=export_stamp_path(out,ep)
+   if not export_stamp_matches_file(stamp,dest):
+    raise ValueError(f'{dest.name} 已存在且不是本任务已记录的导出文件；请更换输出目录或先移走该文件。')
+   try:signature=json.loads(stamp.read_text(encoding='utf-8')).get('signature')
+   except (OSError,ValueError,TypeError):signature=None
+   if signature not in compatible_video_signatures(row,settings,assets):
+    raise ValueError(f'{dest.name} 属于旧切点或不同的成片设置。为避免覆盖已有成片，已阻止导出；请另选空目录，原视频与旧成片均未修改。')
  srt_folder=None
  if settings.get('exportSrt',False):
   if not settings.get('srtFolder'):
@@ -803,21 +892,14 @@ def export_episodes(rows,settings,out,progress):
   srt_folder=safe_out(settings['srtFolder'])
   if srt_folder==out:raise ValueError('SRT 目录必须与 MP4 目录分开。')
   validate_srt_folder(rows,srt_folder)
- done=[];assets=render_assets(settings);started=time.monotonic()
+ done=[];started=time.monotonic()
  for i,row in enumerate(rows):
   ep=episodes[i];dest=out/f'{ep}.mp4';stamp=export_stamp_path(out,ep)
   remaining=round((time.monotonic()-started)/i*(len(rows)-i)/60) if i else None
   estimate=f' · 粗略剩余 {remaining} 分钟' if remaining is not None else ''
   progress(f'视频 {i+1}/{len(rows)} · EP{ep}{estimate}',i/len(rows)*100)
   signature=render_signature(settings,[row],assets)
-  valid_signatures={signature}
-  valid_signatures.add(legacy_render_signature(settings,[row],assets))
-  # Keep resumable beta.2 renders when the user explicitly selects the
-  # unchanged software quality mode; fast mode produces a different encode.
-  if settings.get('encodingMode')=='quality':
-   old_settings=dict(settings);old_settings.pop('encodingMode',None)
-   valid_signatures.add(render_signature(old_settings,[row],assets))
-   valid_signatures.add(legacy_render_signature(old_settings,[row],assets))
+  valid_signatures=compatible_video_signatures(row,settings,assets)
   reused=False
   if export_stamp_matches_file(stamp,dest):
    try:
@@ -919,7 +1001,7 @@ class Handler(BaseHTTPRequestHandler):
      recent=max(runs.values(),key=lambda r:r.get('updatedAt',0)) if runs else {}
      video_runs=[r for name,r in runs.items() if name in {'normal','clean'}]
      output_run=max(video_runs,key=lambda r:r.get('updatedAt',0)) if video_runs else {}
-     STATE.update(files=copy.deepcopy(snapshot['files']),poster=snapshot.get('poster'),plan=copy.deepcopy(snapshot['plan']),planParams=snapshot['planParams'],planFingerprints=snapshot['fingerprints'],posterFingerprint=snapshot.get('posterFingerprint'),settings=copy.deepcopy(recent.get('settings') or snapshot['settings']),sourceOrderMode=snapshot.get('sourceOrderMode','auto'),orderConfirmed=True,samples={},sampleCovers={},sampleSignature=None)
+     STATE.update(files=copy.deepcopy(snapshot['files']),poster=snapshot.get('poster'),plan=copy.deepcopy(snapshot['plan']),planParams=snapshot['planParams'],planFingerprints=snapshot['fingerprints'],posterFingerprint=snapshot.get('posterFingerprint'),sourceBounds=copy.deepcopy(snapshot.get('sourceBounds')),settings=copy.deepcopy(recent.get('settings') or snapshot['settings']),sourceOrderMode=snapshot.get('sourceOrderMode','auto'),orderConfirmed=True,samples={},sampleCovers={},sampleSignature=None)
      persist()
      self.respond({**{k:v for k,v in STATE.items() if k!='analyses'},'outputFolder':output_run.get('folder',''),'srtFolder':runs.get('srt',{}).get('folder','')})
    elif path=='/history/delete':
@@ -948,7 +1030,7 @@ class Handler(BaseHTTPRequestHandler):
      if unchanged:
       try:require_current_plan(STATE['settings'])
       except ValueError:unchanged=False
-     changes={} if unchanged else dict(plan=[],planParams=None,planFingerprints=None,posterFingerprint=None,samples={},sampleCovers={},sampleSignature=None)
+     changes={} if unchanged else dict(plan=[],planParams=None,planFingerprints=None,posterFingerprint=None,sourceBounds=None,samples={},sampleCovers={},sampleSignature=None)
      STATE.update(files=ordered,orderConfirmed=True,sourceOrderMode='auto' if mode=='auto' else 'manual',**changes)
     persist()
     self.respond({'files':ordered,'duration':sum(f['duration'] for f in ordered),'size':sum(f['size'] for f in ordered),'reused':unchanged,'plan':STATE['plan'] if unchanged else []})
@@ -964,19 +1046,56 @@ class Handler(BaseHTTPRequestHandler):
    elif path=='/validate-effect-visual':
     self.respond({'path':checked_effect_visual(data.get('path',''))})
    elif path=='/plan':self.respond(start_job('plan',lambda progress:plan(data,progress)))
+   elif path=='/validate-plan':
+    with LOCK:
+     STATE['settings'].update(data.get('settings',{}))
+     require_current_plan(STATE['settings'])
+    self.respond({'valid':True,'episodes':len(STATE['plan'])})
+   elif path=='/repair-plan':
+    with LOCK:
+     if STATE.get('job') and STATE['job']['status']=='running':raise ValueError('任务运行中，暂不能修复切点。')
+     if not STATE.get('plan'):raise ValueError('尚无分集方案，请先生成切点。')
+     snapshot={'files':STATE['files'],'fingerprints':STATE.get('planFingerprints'),
+               'poster':STATE.get('poster'),'posterFingerprint':STATE.get('posterFingerprint'),
+               'planParams':STATE.get('planParams')}
+     if not snapshot_valid(snapshot):raise ValueError('原片或海报已变化、或 NAS 未挂载；请先核查素材，不能用旧记录补齐。')
+     repaired,fixed=repair_missing_tails(STATE['plan'],STATE['files'],current_source_bounds(),STATE['planParams'])
+     if fixed:
+      STATE.update(plan=repaired,samples={},sampleCovers={},sampleSignature=None)
+      persist();save_analysis_history()
+     self.respond({'plan':repaired,'fixed':fixed})
    elif path=='/update-cut':
     ix=int(data['index']);t=float(data['time'])
     with LOCK:
-     rows=STATE['plan'];a=rows[ix];b=rows[ix+1] if ix+1<len(rows) else None
+     if STATE.get('job') and STATE['job']['status']=='running':raise ValueError('任务运行中，暂不能修改切点。')
+     require_current_plan(STATE['settings'])
+     if not math.isfinite(t) or ix<0 or ix>=len(STATE['plan']):raise ValueError('切点集号或时间无效，请重新选择。')
+     rows=copy.deepcopy(STATE['plan']);a=rows[ix];b=rows[ix+1] if ix+1<len(rows) else None
      adjacent=bool(b and a['source']==b['source'])
-     upper=b['end']-3 if adjacent else STATE['files'][a['source']]['duration']
-     if t<=a['start']+3 or t>=upper:raise ValueError('切点需在原集时长内；相邻片段两侧至少保留 3 秒。')
-     a['end']=t;a['duration']=round(t-a['start'],2);a['cutReason']='人工调整';a['confidence']=100;a['review']=False
-     if adjacent:b['start']=t;b['duration']=round(b['end']-t,2)
+     original_end=a['end']
+     upper=b['end']-3 if adjacent else original_end-3
+     if abs(t-original_end)<.005 and not adjacent:
+      self.respond({'plan':rows,'created':False});return
+     if t<a['start']+3 or t>upper:
+      raise ValueError(f'原集{a["sourceOrdinal"]}的切点需让前后剧情各保留至少 3 秒；本次未保存，源视频与其他分集不变。')
+     a['end']=round(t,2);a['duration']=round(a['end']-a['start'],2)
+     a['cutReason']='人工调整';a['confidence']=100
+     if adjacent:
+      b['start']=a['end'];b['duration']=round(b['end']-b['start'],2)
+     else:
+      tail=copy.deepcopy(a)
+      tail.update(start=a['end'],end=original_end,cutReason='原集结尾',confidence=90)
+      rows.insert(ix+1,tail)
+     renumber_plan(rows,STATE['files'],STATE['planParams'])
+     minimum=float(STATE['planParams'].get('minSeconds') or 45)
+     maximum=float(STATE['planParams'].get('maxSeconds') or 60)
+     for row in (a,b if adjacent else tail):row['review']=row['duration']<minimum or row['duration']>maximum
+     validate_plan_coverage(rows,STATE['files'],current_source_bounds(),STATE['planParams'])
+     STATE['plan']=rows
      STATE['samples']={};STATE['sampleCovers']={};STATE['sampleSignature']=None
     persist()
     save_analysis_history()
-    self.respond({'plan':rows})
+    self.respond({'plan':rows,'created':not adjacent})
    elif path=='/sample':
     with LOCK:STATE['settings'].update(data.get('settings',{}))
     require_current_plan(STATE['settings'])
